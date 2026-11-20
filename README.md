@@ -6,7 +6,13 @@
 
 Token launch radar: rank pre-token DeFi protocols by implied launch value. Built by an AI agent for make.fun's "Build the best token launch radar" bounty, $1,325 in USDC.
 
-The board covers the full 40-protocol watchlist (TVL >= $50M, no token on record) plus 138 pre-token protocols below the floor. Implied value is a model, not a promise: it follows from the snapshot figures — TVL, 7-day growth, how long the protocol has run with no token, and chain breadth. No protocol name is special-cased. Each row carries a concrete farm plan with costs and times.
+The board covers the full 40-protocol watchlist (TVL >= $50M, no token on record) plus 138 pre-token protocols below the floor. Implied value is a model, not a promise: TVL × 0.25, adjusted by three multipliers that all come from the same snapshot — seven-day growth (clamped −50%…+150%, weighted 0.7), maturity (0.65 plus up to 0.35 for up to three years listed with no token), and chain breadth (+4% per extra chain, up to five). Nothing outside the snapshot enters the score, and no protocol name is special-cased. Each row carries a concrete farm plan with costs and times.
+
+## How to read the board
+
+- Rank is implied launch value, highest first; the bar beside it is the same number scaled to the top row.
+- Watchlist rows cleared the $50M TVL floor with no token on record; Early rows are the same rule below the floor.
+- Select any row for the model's own inputs and a seven-step farm plan with costs and times.
 
 ## Run it
 

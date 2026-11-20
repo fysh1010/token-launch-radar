@@ -299,6 +299,74 @@
     return el('section', { class: 'spot', 'aria-label': 'Top three protocols by implied value' }, cards);
   }
 
+  // Distribution of implied value across the board, as one inline SVG built from the rows
+  // already in data.js: eight log-spaced bands, bar height by row count, no library, no network.
+  function distributionChart() {
+    var bands = [
+      { min: 100e6, label: '≥$100M' }, { min: 50e6, label: '$50–100M' }, { min: 20e6, label: '$20–50M' },
+      { min: 10e6, label: '$10–20M' }, { min: 5e6, label: '$5–10M' }, { min: 2e6, label: '$2–5M' },
+      { min: 1e6, label: '$1–2M' }, { min: 0, label: '<$1M' }
+    ];
+    var counts = bands.map(function () { return 0; });
+    DATA.rows.forEach(function (r) {
+      for (var i = 0; i < bands.length; i++) {
+        if (r.implied_value_usd >= bands[i].min) { counts[i]++; return; }
+      }
+    });
+    var max = Math.max.apply(null, counts);
+    var top = 0, modal = 0;
+    counts.forEach(function (c, i) { if (c > counts[modal]) modal = i; });
+    top = counts[0];
+    var sorted = DATA.rows.map(function (r) { return r.implied_value_usd; }).sort(function (a, b) { return b - a; });
+    var median = Math.round((sorted[88] + sorted[89]) / 2);
+    var parts = ['<svg viewBox="0 0 640 168" role="img" aria-label="Distribution of implied value across ' + DATA.board_size + ' rows">'];
+    parts.push('<line x1="0" y1="128" x2="640" y2="128" stroke="#e0d9ca" stroke-width="1"/>');
+    counts.forEach(function (c, i) {
+      var h = max ? Math.round((c / max) * 96) : 0;
+      var x = i * 80 + 18;
+      var fill = i === 0 ? '#b45309' : '#0f766e';
+      if (h > 0) parts.push('<rect x="' + x + '" y="' + (128 - h) + '" width="44" height="' + h + '" rx="3" fill="' + fill + '"/>');
+      parts.push('<text x="' + (x + 22) + '" y="' + (128 - h - 6) + '" text-anchor="middle" font-size="12" font-family="ui-monospace, Menlo, monospace" fill="#16222e">' + c + '</text>');
+      parts.push('<text x="' + (x + 22) + '" y="148" text-anchor="middle" font-size="11" font-family="ui-monospace, Menlo, monospace" fill="#5b6a76">' + bands[i].label + '</text>');
+    });
+    parts.push('</svg>');
+    return el('div', { class: 'chart' },
+      el('div', { html: parts.join('') }),
+      el('p', { class: 'cap', text: 'Median row: ' + fmtUsd(median) + ' implied · ' + top + ' rows above $100M · most rows sit in the ' + bands[modal].label + ' band.' })
+    );
+  }
+
+  // Top five categories by total implied value, each with its row count.
+  function categoryStrip() {
+    var byCat = {};
+    DATA.rows.forEach(function (r) {
+      var c = r.category || 'Other';
+      if (!byCat[c]) byCat[c] = { name: c, count: 0, total: 0 };
+      byCat[c].count++;
+      byCat[c].total += r.implied_value_usd;
+    });
+    var top = Object.keys(byCat).map(function (k) { return byCat[k]; })
+      .sort(function (a, b) { return b.total - a.total; }).slice(0, 5);
+    return el('div', { class: 'cat-strip' }, top.map(function (c) {
+      return el('div', { class: 'cat' },
+        el('b', { text: c.name }),
+        el('span', { text: c.count + ' rows' }),
+        el('span', { text: fmtUsd(c.total) + ' implied' })
+      );
+    }));
+  }
+
+  function overview() {
+    return el('section', { class: 'panel overview', 'aria-label': 'Where the implied value sits' },
+      el('div', { class: 'overview-head' },
+        el('h2', { text: 'Where the value sits' }),
+        el('p', { class: 'sub', text: 'Five protocols clear $100M; the long tail is the story — most of the board is small, young and unpriced.' })
+      ),
+      distributionChart(),
+      categoryStrip()
+    );
+  }
+
   function controls() {
     var categories = Array.from(new Set(DATA.rows.map(function (r) { return r.category || 'Other'; }))).sort();
     var search = el('input', { type: 'search', id: 'q', placeholder: 'Search name, category or chain', value: state.q, 'aria-label': 'Search the board' });
@@ -482,7 +550,10 @@
     shell.appendChild(spotlight());
     shell.appendChild(controls());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
-    if (state.tab === 'pre-token') shell.appendChild(modelPanel());
+    if (state.tab === 'pre-token') {
+      shell.appendChild(overview());
+      shell.appendChild(modelPanel());
+    }
     shell.appendChild(el('p', { class: 'note', text: 'Source: DefiLlama protocol index, snapshot ' + DATA.as_of + '. "Records no token" means the snapshot carries no market cap, CoinGecko id or symbol for the protocol; it is not proof none exists. Implied value is this entry\'s own model, never a price, and no farm plan promises a token or an airdrop.' }));
     app.appendChild(shell);
     app.setAttribute('aria-busy', 'false');

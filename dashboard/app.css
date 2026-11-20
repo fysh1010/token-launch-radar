@@ -86,6 +86,14 @@ a { color: var(--accent); }
 .cat b { font-size: 14px; overflow-wrap: anywhere; }
 .cat span { color: var(--muted); font-size: 12px; font-family: var(--font-num); white-space: nowrap; }
 
+.compare { margin-bottom: var(--step-5); padding: var(--step-5); display: grid; gap: var(--step-4); }
+.movers { display: grid; grid-template-columns: 1fr 1fr; gap: var(--step-5); }
+.movers h3 { margin-bottom: var(--step-2); }
+.mover { display: grid; gap: 2px; padding: var(--step-2) 0; border-top: 1px solid var(--border); }
+.mover b { font-size: 14px; }
+.mover .num { font-family: var(--font-num); font-size: 13px; }
+.mover .sub { font-size: 12px; }
+
 .controls { display: flex; flex-wrap: wrap; align-items: end; gap: var(--step-3); padding: var(--step-4) 0; border-top: 1px solid var(--border); }
 .field { display: grid; gap: var(--step-1); }
 .field label { color: var(--muted); font-size: 12px; }
@@ -168,6 +176,7 @@ tbody tr[data-selected="true"] { background: var(--accent-soft); }
   .overview { padding: var(--step-4); }
   .cat-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .cat span { white-space: normal; }
+  .movers { grid-template-columns: 1fr; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }

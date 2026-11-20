@@ -1,10 +1,11 @@
-// Token Radar's dashboard, model radar-2. It reads window.RADAR (written beside dashboard/ by
+// Token Radar's dashboard, model radar-3. It reads window.RADAR (written beside dashboard/ by
 // main.ts) and renders the ranked board, a filterable table, a per-protocol detail drawer with the
 // model's own inputs and the protocol's farm plan. No network: every byte it shows is in data.js.
 //
-// Two derivations live here, and both are the same arithmetic main.ts writes to board.json, so the
-// page and the board agree: impliedOf recomputes a row from the snapshot figures, and farmSteps
-// rebuilds a row's plan from its category, chains, TVL and age. No protocol name is special-cased.
+// Three derivations live here, and all are the same arithmetic main.ts writes to board.json, so
+// the page and the board agree: impliedOf recomputes a row from the snapshot figures, v2ImpliedOf
+// recomputes the previous release's value for the comparison, and farmSteps rebuilds a row's plan
+// from its category, chains, TVL and age. No protocol name is special-cased.
 (function () {
   'use strict';
 
@@ -32,17 +33,62 @@
   }
   function fmtMult(n) { return (Math.round(n * 10000) / 10000).toFixed(2) + 'x'; }
 
-  // The model in one function: TVL x base multiple, times the growth, maturity and chain-breadth
-  // multipliers. The page recomputes a row and checks the number board.json carries, so the page's
-  // code and the board's data are visibly the same arithmetic.
-  function impliedOf(row, model) {
-    var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
-    var growthMult = 1 + (growth / 100) * model.growth_weight;
-    var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
-    var maturity = model.maturity_floor + (Math.min(Math.max(age, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-    var chainSteps = Math.min(Math.max((row.chains || []).length - 1, 0), model.chain_max_steps);
-    var chainMult = 1 + chainSteps * model.chain_step;
-    return Math.max(1, Math.round(row.tvl_usd * model.base_multiple * growthMult * maturity * chainMult));
+  // The model in one function: a sub-linear TVL base anchored on the board median, times a
+  // growth factor measured against the protocol's own category, times a chain-breadth factor.
+  // The medians are board-wide figures, computed here from the same rows data.js carries, so the
+  // page recomputes a row and checks the number board.json carries, and the page's code and the
+  // board's data are visibly the same arithmetic.
+  function medianOf(values) {
+    var s = values.slice().sort(function (a, b) { return a - b; });
+    var n = s.length;
+    if (n === 0) return null;
+    if (n % 2 === 1) return s[(n - 1) / 2];
+    return Math.round(((s[n / 2 - 1] + s[n / 2]) / 2) * 100) / 100;
+  }
+  function modelContext() {
+    var tvlMedian = medianOf(DATA.rows.map(function (r) { return r.tvl_usd; }));
+    var byCat = {};
+    DATA.rows.forEach(function (r) {
+      if (r.change_7d === null || r.change_7d === undefined) return;
+      var c = r.category || 'Other';
+      if (!byCat[c]) byCat[c] = [];
+      byCat[c].push(r.change_7d);
+    });
+    var catMedian = {};
+    Object.keys(byCat).forEach(function (k) { catMedian[k] = medianOf(byCat[k]); });
+    return { tvlMedian: tvlMedian, catMedian: catMedian };
+  }
+  var CTX = modelContext();
+  function tvlBaseOf(row) {
+    var m = DATA.model;
+    return m.base_multiple * Math.pow(row.tvl_usd, m.tvl_exponent) * Math.pow(CTX.tvlMedian, m.median_exponent);
+  }
+  function growthFactorOf(row) {
+    var m = DATA.model;
+    if (row.change_7d === null || row.change_7d === undefined) return 1;
+    var med = CTX.catMedian[row.category || 'Other'];
+    if (med === null || med === undefined) return 1;
+    return 1 + m.growth_weight * Math.tanh((row.change_7d - med) / m.growth_scale);
+  }
+  function chainFactorOf(row) {
+    var m = DATA.model;
+    return 1 + m.chain_step * Math.min(Math.max((row.chains || []).length - 1, 0), m.chain_max_steps);
+  }
+  function impliedOf(row) {
+    return Math.max(1, Math.round(tvlBaseOf(row) * growthFactorOf(row) * chainFactorOf(row)));
+  }
+
+  // The previous release's value, recomputed live for the comparison: linear TVL, clamped
+  // seven-day growth weighted 0.7, a maturity factor that pays older protocols, 4% a chain.
+  // Comparison only — the board never ranks on it.
+  function v2ImpliedOf(row) {
+    var growth = Math.min(150, Math.max(-50, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
+    var growthMult = 1 + (growth / 100) * 0.7;
+    var age = row.age_days === null || row.age_days === undefined ? 365 : row.age_days;
+    var maturity = 0.65 + (Math.min(Math.max(age, 0), 1095) / 1095) * 0.35;
+    var chainSteps = Math.min(Math.max((row.chains || []).length - 1, 0), 5);
+    var chainMult = 1 + chainSteps * 0.04;
+    return Math.max(1, Math.round(row.tvl_usd * 0.25 * growthMult * maturity * chainMult));
   }
 
   function el(tag, attrs) {
@@ -76,7 +122,7 @@
     if (p.tvl_usd >= 1e8) return 100;
     return 50;
   }
-  function gasFor(p) { return chainOf(p) === 'Ethereum' ? 12 : 4; }
+  function gasRange(p) { return chainOf(p) === 'Ethereum' ? '$8-15' : '$1-5'; }
   function holdDaysFor(age) {
     if (age === null || age === undefined) return 30;
     if (age < 180) return 60;
@@ -113,15 +159,15 @@
     if (c.indexOf('lend') >= 0 || c.indexOf('collateral') >= 0) return 'Supply $' + capital + ' of USDC to ' + name + ' on ' + chain + ', borrow a small amount against it, and keep the health factor above the liquidation line.';
     if (c.indexOf('interest rate') >= 0) return 'Deposit $' + capital + ' of USDC as margin for one interest-rate position on ' + name + ' on ' + chain + ', and close it before the rate leg moves against you.';
     if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0) return 'Deposit $' + capital + ' of USDC as margin on ' + name + ' on ' + chain + ', open one small hedged position, and set a stop so it closes before liquidation.';
-    if (c.indexOf('basis') >= 0) return 'Deposit $' + capital + " of USDC into " + name + "'s basis vault on " + chain + ' and hold the delta-neutral position while funding stays positive.';
-    if (c.indexOf('options') >= 0) return 'Deposit $' + capital + ' of USDC into an options vault on ' + name + ' on ' + chain + ' and hold the vault shares through one expiry.';
-    if (c.indexOf('leveraged farm') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + "'s leveraged farm on " + chain + ' at the lowest leverage it offers, and watch the borrow rate daily.';
-    if (c.indexOf('dex') >= 0) return 'Provide $' + capital + ' of liquidity to ' + name + "'s main USDC pair on " + chain + ', keeping the position in range, and collect the trading fees.';
-    if (c.indexOf('liquidity manager') >= 0) return 'Deposit $' + capital + ' of USDC into a ' + name + ' managed vault on ' + chain + ' and let the manager rebalance the range; keep the shares.';
-    if (c.indexOf('yield aggregator') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + "'s largest vault on " + chain + ' and keep the shares while the strategy runs.';
-    if (c.indexOf('yield') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + "'s yield vault on " + chain + ' and keep the shares while the yield runs.';
-    if (c.indexOf('curator') >= 0) return 'Deposit $' + capital + ' of USDC into a ' + name + ' curated vault on ' + chain + ' and keep the vault shares; the curator picks the underlying markets, not you.';
-    if (c.indexOf('allocator') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + "'s allocator vault on " + chain + ' and let it rotate the funds between strategies.';
+    if (c.indexOf('basis') >= 0) return 'Deposit $' + capital + " of USDC into " + name + "'s basis vault on " + chain + ' (confirm the vault exists on the protocol\'s own page first) and hold the delta-neutral position while funding stays positive.';
+    if (c.indexOf('options') >= 0) return 'Deposit $' + capital + ' of USDC into an options vault on ' + name + ' on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and hold the vault shares through one expiry.';
+    if (c.indexOf('leveraged farm') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + "'s leveraged farm on " + chain + ' (confirm the farm exists on the protocol\'s own page first) at the lowest leverage it offers, and watch the borrow rate daily.';
+    if (c.indexOf('dex') >= 0) return 'Provide $' + capital + ' of liquidity to ' + name + "'s main pool on " + chain + ' (confirm the pool exists on the protocol\'s own page first), keeping the position in range, and collect the trading fees.';
+    if (c.indexOf('liquidity manager') >= 0) return 'Deposit $' + capital + ' of USDC into a ' + name + ' managed vault on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and let the manager rebalance the range; keep the shares.';
+    if (c.indexOf('yield aggregator') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + "'s main vault on " + chain + ' (confirm the vault exists on the protocol\'s own page first) and keep the shares while the strategy runs.';
+    if (c.indexOf('yield') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + "'s yield vault on " + chain + ' (confirm the vault exists on the protocol\'s own page first) and keep the shares while the yield runs.';
+    if (c.indexOf('curator') >= 0) return 'Deposit $' + capital + ' of USDC into a ' + name + ' curated vault on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and keep the vault shares; the curator picks the underlying markets, not you.';
+    if (c.indexOf('allocator') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + "'s allocator vault on " + chain + ' (confirm the vault exists on the protocol\'s own page first) and let it rotate the funds between strategies.';
     if (c.indexOf('restak') >= 0) return 'Restake $' + capital + ' of the receipt token through ' + name + ' on ' + chain + ' and keep the restaking receipt.';
     if (c.indexOf('staking') >= 0) return "Stake $" + capital + " of the chain's staking asset through " + name + ' on ' + chain + ' and keep the receipt token.';
     if (c.indexOf('bridge') >= 0) return 'Bridge $' + capital + ' of USDC to ' + chain + ' through ' + name + ' and use the bridged funds in its app the same week.';
@@ -135,7 +181,7 @@
     if (c.indexOf('launchpad') >= 0) return 'Join one ' + name + ' launch with $' + capital + ' on ' + chain + ' and hold the allocation through the lock-up.';
     if (c.indexOf('token locker') >= 0) return 'Lock $' + capital + ' of an asset in ' + name + ' on ' + chain + ' for the shortest term it offers.';
     if (c.indexOf('otc') >= 0) return 'Place one OTC trade of $' + capital + ' through ' + name + ' on ' + chain + ' and keep the trade receipt.';
-    if (c.indexOf('cedefi') >= 0) return 'Deposit $' + capital + " of USDC into " + name + "'s CeDeFi vault on " + chain + ' and keep the position open; the vault runs off-chain strategies.';
+    if (c.indexOf('cedefi') >= 0) return 'Deposit $' + capital + " of USDC into " + name + "'s CeDeFi vault on " + chain + ' (confirm the vault exists on the protocol\'s own page first) and keep the position open; the vault runs off-chain strategies.';
     if (c.indexOf('payment') >= 0) return 'Pay or receive $' + capital + ' through ' + name + ' on ' + chain + ' and keep the payment receipt.';
     if (c.indexOf('governance') >= 0) return 'Lock $' + capital + ' of the governance asset through ' + name + ' on ' + chain + ' and cast one vote in its next proposal.';
     if (c.indexOf('card') >= 0) return 'Spend $' + capital + ' through a ' + name + ' card on ' + chain + ' and keep the statement for the farm log.';
@@ -192,15 +238,15 @@
     var chain = chainOf(p);
     var second = secondChainOf(p);
     var capital = capitalFor(p);
-    var gas = gasFor(p);
+    var gas = gasRange(p);
     var hold = holdDaysFor(p.age_days);
     var secondClause = second === null ? '' : ' Alternate weeks between ' + chain + ' and ' + second + ' so both chains show activity.';
     var youngClause = p.age_days !== null && p.age_days !== undefined && p.age_days < 90 ? ' The protocol is only ' + p.age_days + ' days old, so check its announcements weekly too.' : '';
     var logSecond = second === null ? '' : ' Note the second chain, ' + second + ', if you farmed there too.';
     return [
-      { text: 'Set up a fresh wallet on ' + chain + ' with $' + capital + ' of USDC and about $' + gas + ' for gas, and keep its seed phrase offline. ' + growthNote(p), cost: 'about $' + gas + ' of gas to fund the wallet', time: '10 minutes' },
-      { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + gas + ' of gas', time: '15 minutes to set up' },
-      { text: 'Do one qualifying action each week, such as ' + weeklyActionFor(p) + ', so the wallet reads as active rather than one-off.' + secondClause + youngClause, cost: 'about $2 of gas a week', time: '10 minutes a week' },
+      { text: 'Set up a fresh wallet on ' + chain + ' with $' + capital + ' of USDC and gas money of roughly ' + gas + ' (an estimate, gas moves with the network), and keep its seed phrase offline. ' + growthNote(p), cost: 'gas of roughly ' + gas + ' (estimate) to fund the wallet', time: '10 minutes' },
+      { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and gas of roughly ' + gas + ' (estimate)', time: '15 minutes to set up' },
+      { text: 'Do one qualifying action each week, such as ' + weeklyActionFor(p) + ', so the wallet reads as active rather than one-off.' + secondClause + youngClause, cost: 'a few dollars of gas a week', time: '10 minutes a week' },
       { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot. ' + ageNote(p.age_days, hold) + ' TVL is ' + fmtTvl(p.tvl_usd) + ', so your $' + capital + ' position is a small share of the pool.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
       { text: checkActionFor(p, chain) + ' Claim only from the link the protocol itself publishes, and never pay to claim.', cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
       { text: 'Write the wallet, the dates and every transaction in a farm log: ' + p.name + ' on ' + chain + ', $' + capital + ' entered, hold ends after ' + hold + ' days.' + logSecond, cost: 'nothing but the log', time: '5 minutes' },
@@ -317,8 +363,7 @@
     var top = 0, modal = 0;
     counts.forEach(function (c, i) { if (c > counts[modal]) modal = i; });
     top = counts[0];
-    var sorted = DATA.rows.map(function (r) { return r.implied_value_usd; }).sort(function (a, b) { return b - a; });
-    var median = Math.round((sorted[88] + sorted[89]) / 2);
+    var median = medianOf(DATA.rows.map(function (r) { return r.implied_value_usd; }));
     var parts = ['<svg viewBox="0 0 640 168" role="img" aria-label="Distribution of implied value across ' + DATA.board_size + ' rows">'];
     parts.push('<line x1="0" y1="128" x2="640" y2="128" stroke="#e0d9ca" stroke-width="1"/>');
     counts.forEach(function (c, i) {
@@ -336,14 +381,15 @@
     );
   }
 
-  // Top five categories by total implied value, each with its row count.
+  // Top five categories by total implied value, each with its row count and median row.
   function categoryStrip() {
     var byCat = {};
     DATA.rows.forEach(function (r) {
       var c = r.category || 'Other';
-      if (!byCat[c]) byCat[c] = { name: c, count: 0, total: 0 };
+      if (!byCat[c]) byCat[c] = { name: c, count: 0, total: 0, values: [] };
       byCat[c].count++;
       byCat[c].total += r.implied_value_usd;
+      byCat[c].values.push(r.implied_value_usd);
     });
     var top = Object.keys(byCat).map(function (k) { return byCat[k]; })
       .sort(function (a, b) { return b.total - a.total; }).slice(0, 5);
@@ -351,7 +397,8 @@
       return el('div', { class: 'cat' },
         el('b', { text: c.name }),
         el('span', { text: c.count + ' rows' }),
-        el('span', { text: fmtUsd(c.total) + ' implied' })
+        el('span', { text: fmtUsd(c.total) + ' implied' }),
+        el('span', { text: fmtUsd(medianOf(c.values)) + ' median' })
       );
     }));
   }
@@ -364,6 +411,37 @@
       ),
       distributionChart(),
       categoryStrip()
+    );
+  }
+
+  // Radar-2 versus radar-3: what the model change did to the ranking. The build computes the
+  // correlation and the movers; the page renders them. Each row's radar-2 value is recomputed
+  // live in its detail drawer.
+  function comparisonPanel() {
+    var comp = DATA.comparison;
+    if (!comp) return null;
+    var mover = function (m) {
+      return el('div', { class: 'mover' },
+        el('b', { text: m.name }),
+        el('span', { class: 'num', text: 'radar-2 #' + m.v2_rank + '  →  radar-3 #' + m.v4_rank }),
+        el('span', { class: 'sub', text: m.reason })
+      );
+    };
+    return el('section', { class: 'panel compare', 'aria-label': 'Radar-2 versus radar-3' },
+      el('div', { class: 'overview-head' },
+        el('h2', { text: 'Radar-2 vs radar-3: what changed' }),
+        el('p', { class: 'sub', text: 'Spearman rank correlation ' + comp.spearman.toFixed(2) + ' — the two models mostly agree; the differences are the point. Radar-3 scores TVL sub-linearly, measures growth against the protocol\'s own category, and drops the age discount.' })
+      ),
+      el('div', { class: 'movers' },
+        el('div', null,
+          el('h3', { text: 'Biggest rises' }),
+          comp.rises.map(function (m) { return mover(m); })
+        ),
+        el('div', null,
+          el('h3', { text: 'Biggest falls' }),
+          comp.falls.map(function (m) { return mover(m); })
+        )
+      )
     );
   }
 
@@ -482,9 +560,9 @@
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x ' + m.base_multiple + ' x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + ' + m.chain_step + ' x min(chains - 1, ' + m.chain_max_steps + ')) )'
+        'implied = round( ' + m.base_multiple + ' x tvl_usd^' + m.tvl_exponent + ' x tvl_median^' + m.median_exponent + ' x (1 + ' + m.growth_weight + ' x tanh((change_7d - category_median_7d) / ' + m.growth_scale + ')) x (1 + ' + m.chain_step + ' x min(chains - 1, ' + m.chain_max_steps + ')) )'
       ),
-      el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. Chain breadth is how many chains the protocol runs on: more chains, more wallets on launch day. Wrapped, staked and bridged products of a token that already trades are kept off the board, and a protocol above the floor that the watchlist leaves out is never re-added: the house left it out on a record this snapshot does not carry.' })
+      el('p', { class: 'sub', text: 'TVL enters sub-linearly, anchored on the board median TVL of ' + fmtUsd(CTX.tvlMedian) + ': a protocol ten times bigger is worth about seven times more, not ten, so the board is not a TVL ranking with a coat of paint. Growth is measured against the protocol\'s own category median: outgrowing your own kind is the signal, and a short spike saturates instead of paying up to 2.05x. Age is shown on the board for reference but scores nothing. Chain breadth is how many chains the protocol runs on: more chains, more wallets on launch day. Wrapped, staked and bridged products of a token that already trades are kept off the board, and a protocol above the floor that the watchlist leaves out is never re-added: the house left it out on a record this snapshot does not carry.' })
     );
   }
 
@@ -498,8 +576,10 @@
     writeHash();
     dialog.textContent = '';
     var steps = farmSteps(row);
-    var recomputed = impliedOf(row, DATA.model);
+    var recomputed = impliedOf(row);
     var match = recomputed === row.implied_value_usd;
+    var v2recomputed = v2ImpliedOf(row);
+    var v2match = v2recomputed === row.v2_implied;
     var standing = row.category_tvl_rank !== null && row.category_tvl_rank !== undefined
       ? 'TVL rank ' + row.category_tvl_rank + ' in ' + (row.category || 'Other') + (row.category_growth_median !== null && row.category_growth_median !== undefined ? ', against a category median 7d growth of ' + fmtPct(row.category_growth_median) : '')
       : null;
@@ -511,20 +591,30 @@
       ),
       el('button', { class: 'close', type: 'button', 'aria-label': 'Close details', text: 'Close', onclick: function () { dialog.close(); } })
     ));
+    var catMed = CTX.catMedian[row.category || 'Other'];
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Implied value' }),
       el('div', { class: 'equation' },
-        el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
-        el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Chains' }), el('b', { class: 'num', text: String((row.chains || []).length) })),
-        el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: fmtMult(row.growth_multiplier) })),
-        el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: fmtMult(row.maturity_multiplier) })),
-        el('div', null, el('span', { text: 'Chain multiplier' }), el('b', { class: 'num', text: fmtMult(row.chain_multiplier) })),
+        el('div', null, el('span', { text: 'TVL base: 0.25 x TVL^0.85 x median^0.15' }), el('b', { class: 'num', text: fmtUsd(tvlBaseOf(row)) })),
+        el('div', null, el('span', { text: 'Growth factor: 7d vs category median' }), el('b', { class: 'num', text: fmtMult(growthFactorOf(row)) })),
+        el('div', null, el('span', { text: 'Chain factor: ' + (row.chains || []).length + ' chains' }), el('b', { class: 'num', text: fmtMult(chainFactorOf(row)) })),
         el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (match ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' }),
+      el('p', { class: 'sub', text: 'TVL ' + fmtUsd(row.tvl_usd) + ' against a board median of ' + fmtUsd(CTX.tvlMedian) + '; seven-day growth ' + fmtPct(row.change_7d) + ' against a ' + (row.category || 'Other') + ' median of ' + fmtPct(catMed) + '. Age with no token, ' + fmtAge(row.age_days) + ', is shown for reference and scores nothing. Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (match ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' }),
+      el('p', { class: 'sub', text: 'Under radar-2 this protocol ranked #' + row.v2_rank + ' with an implied value of ' + fmtUsd(row.v2_implied) + ' (recomputed ' + fmtUsd(v2recomputed) + (v2match ? ', matching.' : ', differing: the data would be stale.') + ' Radar-3 ranks it #' + row.rank + '.' }),
       standing ? el('p', { class: 'sub', text: standing + '.' }) : null
+    ));
+    var capital = capitalFor(row);
+    var hold = holdDaysFor(row.age_days);
+    dialog.appendChild(el('section', { class: 'detail-section' },
+      el('h3', { text: 'Budget and risk' }),
+      el('div', { class: 'equation' },
+        el('div', null, el('span', { text: 'Capital for one position' }), el('b', { class: 'num', text: '$' + capital })),
+        el('div', null, el('span', { text: 'Gas (estimate, not a quote)' }), el('b', { class: 'num', text: 'roughly ' + gasRange(row) })),
+        el('div', null, el('span', { text: 'Hold at least' }), el('b', { class: 'num', text: hold + ' days' })),
+        el('div', null, el('span', { text: 'Exit rule' }), el('b', { class: 'num', text: 'unwind if TVL halves from ' + fmtTvl(row.tvl_usd) }))
+      ),
+      el('p', { class: 'sub', text: 'Gas is an estimate range: it moves with the network, and the plan never states a flat fee. Nothing here promises a token or an airdrop.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan' }),
@@ -552,6 +642,8 @@
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
     if (state.tab === 'pre-token') {
       shell.appendChild(overview());
+      var compare = comparisonPanel();
+      if (compare) shell.appendChild(compare);
       shell.appendChild(modelPanel());
     }
     shell.appendChild(el('p', { class: 'note', text: 'Source: DefiLlama protocol index, snapshot ' + DATA.as_of + '. "Records no token" means the snapshot carries no market cap, CoinGecko id or symbol for the protocol; it is not proof none exists. Implied value is this entry\'s own model, never a price, and no farm plan promises a token or an airdrop.' }));

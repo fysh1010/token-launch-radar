@@ -1,4 +1,4 @@
-// Token Radar's scoring model, release radar-2: a sealed snapshot goes in, a ranked board comes out.
+// Token Radar's scoring model, release radar-3: a sealed snapshot goes in, a ranked board comes out.
 //
 // Which protocols make the board. The board always carries every slug the snapshot's watchlist
 // names — that list is the floor, never the ceiling — and on top of it the early radar adds
@@ -20,20 +20,24 @@
 //
 // Implied value comes only from the snapshot's own numbers, the same function scoring every row:
 //
-//   base      = tvl_usd x BASE_MULTIPLE
-//   growth    = clamp(change_7d, -50, 150) per cent          (a missing change counts as 0)
-//   growthMul = 1 + (growth / 100) x GROWTH_WEIGHT
-//   maturity  = 0.65 + min(age_days, 1095) / 1095 x 0.35     (age unknown: 365 days)
-//   chainsMul = 1 + 0.04 x min(max(chains - 1, 0), 5)
-//   implied   = max(1, round(base x growthMul x maturity x chainsMul))
+//   tvl_median  = median TVL across the board's own rows
+//   cat_median  = median seven-day change inside the protocol's category, across the board's rows
+//   tvl_base    = 0.25 x tvl_usd^0.85 x tvl_median^0.15
+//   growth      = 1 + 0.25 x tanh((change_7d - cat_median) / 25)   (a missing change, or a
+//                 category with no usable median, scores 1: no relative signal, no penalty)
+//   chains      = 1 + 0.03 x min(max(chains - 1, 0), 5)
+//   implied     = max(1, round(tvl_base x growth x chains))
 //
-// TVL measures the business a token would price. Seven-day growth is momentum: a protocol
-// adding TVL fast is worth more than a flat one of the same size, and a shrinking one less.
-// Age is how long the protocol has run with no token: survival is the record of a launch that
-// has not happened yet, so older protocols are discounted less. Chain breadth is distribution:
-// a protocol live on more chains reaches more wallets on launch day. No protocol name is ever
-// special-cased, and no row is hand-picked: one function scores every row, and the dashboard
-// prints the formula alongside the constants it runs.
+// TVL enters sub-linearly: a protocol ten times bigger is worth about seven times more, not ten,
+// so the board is not a TVL ranking with a coat of paint. Growth is measured against the
+// protocol's own category, not the raw number: outgrowing your own kind is the signal, and a
+// short spike saturates instead of paying up to 2.05x. Age is shown on the board for reference
+// but scores nothing: a protocol that has run three years with no token is not obviously more
+// likely to launch one than a young one, and the old model paid it up to 1.54x for surviving.
+// Chain breadth is distribution: a protocol live on more chains reaches more wallets on launch
+// day. No protocol name is ever special-cased, and no row is hand-picked: one function scores
+// every row, and the dashboard prints the formula alongside the constants it runs. The previous
+// release's formula is kept beside it as a comparison function only, never for the ranking.
 
 /** A snapshot protocol entry: the ten fields the sealed input carries, no more. */
 export interface SnapshotProtocol {
@@ -60,10 +64,26 @@ export interface Snapshot {
 
 /** The model's constants, the same ones the dashboard prints. */
 export interface ModelConstants {
+  base_multiple: number; // TVL multiple for the base value
+  tvl_exponent: number; // sub-linear TVL exponent, below 1
+  median_exponent: number; // board-median TVL exponent, the complement of the TVL one
+  growth_weight: number; // weight of the category-relative growth factor
+  growth_scale: number; // tanh scale in per cent: how far from the category median saturates
+  chain_step: number; // multiplier step per extra chain
+  chain_max_steps: number; // most extra chains that count
+}
+
+export const MODEL: ModelConstants = { // the constants the dashboard prints
+  base_multiple: 0.25, tvl_exponent: 0.85, median_exponent: 0.15,
+  growth_weight: 0.25, growth_scale: 25, chain_step: 0.03, chain_max_steps: 5,
+};
+
+/** The previous release's constants, kept only for the radar-2 comparison. */
+export interface ModelConstantsV2 {
+  base_multiple: number; // TVL multiple for the base value
   growth_weight: number; // weight of seven-day growth
   growth_floor: number; // growth clamp, low end
   growth_cap: number; // growth clamp, high end
-  base_multiple: number; // TVL multiple for the base value
   maturity_floor: number; // maturity multiplier floor
   maturity_range: number; // maturity multiplier range above the floor
   maturity_days: number; // days to full maturity
@@ -72,14 +92,14 @@ export interface ModelConstants {
   chain_max_steps: number; // most extra chains that count
 }
 
-export const MODEL: ModelConstants = { // the constants the dashboard prints
+export const MODEL_V2: ModelConstantsV2 = { // radar-2, comparison only
   base_multiple: 0.25, growth_weight: 0.7, growth_floor: -50, growth_cap: 150,
   maturity_floor: 0.65, maturity_range: 0.35, maturity_days: 1095,
   unknown_age_days: 365, chain_step: 0.04, chain_max_steps: 5,
 };
 
 /** The model release label, the one the dashboard shows. */
-export const MODEL_VERSION: string = 'radar-2';
+export const MODEL_VERSION: string = 'radar-3';
 
 /** Live-token rows in the dashboard's Live token view, by market cap. */
 export const LIVE_ROWS: number = 24;
@@ -107,13 +127,12 @@ export interface BoardRow {
   age_days: number | null; // days since listing, when known
   token_status: 'pre-token'; // always pre-token on the board
   implied_value_usd: number; // the model's implied value
-  model: { // the multipliers behind the value
-    age_days: number | null; // days used for maturity
-    base_multiple: number; // TVL multiple used
-    growth_pct: number; // clamped seven-day growth
-    growth_multiplier: number; // growth multiplier
-    maturity_multiplier: number; // maturity multiplier
-    chain_multiplier: number; // chain-breadth multiplier
+  model: { // the factors behind the value, each recomputable from the snapshot
+    tvl_base: number; // 0.25 x TVL^0.85 x board-median TVL^0.15, in dollars
+    growth_factor: number; // category-relative growth factor, 0.75..1.25
+    category_median_7d: number | null; // the category median the growth factor measures against
+    chain_factor: number; // chain-breadth factor
+    tvl_median: number; // board-median TVL the base is anchored on
   };
   farm_steps: string[]; // the seven-step farm plan, as text
 }
@@ -131,9 +150,13 @@ export interface RadarRow {
   listed_at: string | null; // listing date
   age_days: number | null; // days since listing, when known
   implied_value_usd: number; // the model's implied value
-  growth_multiplier: number; // growth multiplier
-  maturity_multiplier: number; // maturity multiplier
-  chain_multiplier: number; // chain-breadth multiplier
+  growth_factor: number; // category-relative growth factor
+  chain_factor: number; // chain-breadth factor
+  tvl_base: number; // 0.25 x TVL^0.85 x board-median TVL^0.15, in dollars
+  category_median_7d: number | null; // category median seven-day growth, when one exists
+  tvl_median: number; // board-median TVL the base is anchored on
+  v2_rank: number; // where the previous release ranked this protocol
+  v2_implied: number; // the previous release's implied value for this protocol
   on_watchlist: boolean; // true when the slug is watchlisted
   category_tvl_rank: number | null; // TVL rank inside its category
   category_growth_median: number | null; // category median seven-day growth
@@ -150,6 +173,22 @@ export interface LiveRow {
   change_7d: number | null; // seven-day TVL change, per cent
 }
 
+/** One protocol's move between the two releases: where it stood, where it stands, and why. */
+export interface RankMover {
+  slug: string; // DefiLlama slug
+  name: string; // display name
+  v2_rank: number; // rank under radar-2
+  v4_rank: number; // rank under radar-3
+  reason: string; // the factor that drove the move, in one line
+}
+
+/** How the two releases' rankings relate: their correlation and the biggest moves. */
+export interface ModelComparison {
+  spearman: number; // Spearman rank correlation between the radar-2 and radar-3 rankings
+  rises: RankMover[]; // biggest rank rises, best first
+  falls: RankMover[]; // biggest rank falls, worst first
+}
+
 /** All the dashboard renders: board, live set and the model behind them. */
 export interface RadarData {
   source: string; // where the snapshot came from
@@ -163,6 +202,7 @@ export interface RadarData {
   live_size: number; // live-token row count
   live: LiveRow[]; // live-token protocols, by market cap
   rows: RadarRow[]; // ranked rows, compact form
+  comparison: ModelComparison; // radar-2 versus radar-3, computed by the build
 }
 
 /** Raised when a snapshot is not one this model can score. */
@@ -196,12 +236,39 @@ export function ageDays(
   return days < 0 ? 0 : days;
 }
 
-/** One protocol's four multipliers and implied value under `model`. */
+/** The board-wide figures the radar-3 score is anchored on. */
+export interface ModelContext {
+  tvlMedian: number; // median TVL across the board's rows
+  categoryMedian: Map<string, number>; // median seven-day change per category, over the board's rows
+}
+
+/** One protocol's factors and implied value under radar-3. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   model: ModelConstants,
-): { implied: number; growthPct: number; growthMult: number; maturityMult: number; chainMult: number; age: number | null } {
+  ctx: ModelContext,
+): { implied: number; tvlBase: number; growthFactor: number; categoryMedian: number | null; chainFactor: number; age: number | null } {
+  const protocolAge = ageDays(asOf, protocol.listed_at);
+  const tvlBase = model.base_multiple * Math.pow(protocol.tvl_usd, model.tvl_exponent) * Math.pow(ctx.tvlMedian, model.median_exponent);
+  const catMedian = ctx.categoryMedian.get(protocol.category ?? 'Other') ?? null;
+  const growthFactor = protocol.change_7d === null || catMedian === null
+    ? 1
+    : 1 + model.growth_weight * Math.tanh((protocol.change_7d - catMedian) / model.growth_scale);
+  const chainBonus = Math.max(0, Math.min(protocol.chains.length - 1, model.chain_max_steps));
+  const chainFactor = 1 + chainBonus * model.chain_step;
+  const implied = Math.max(1, Math.round(tvlBase * growthFactor * chainFactor));
+  return { implied, tvlBase, growthFactor, categoryMedian: catMedian, chainFactor, age: protocolAge };
+}
+
+/** One protocol's implied value under radar-2, the previous release. Comparison only: the
+ * board never ranks on it. The old function verbatim: linear TVL, clamped seven-day growth
+ * weighted 0.7, a maturity factor that pays older protocols up to 1.54x, and 4% a chain. */
+export function impliedValueV2(
+  protocol: SnapshotProtocol,
+  asOf: string,
+  model: ModelConstantsV2 = MODEL_V2,
+): number {
   const protocolAge = ageDays(asOf, protocol.listed_at);
   const weekChange = finite(protocol.change_7d, 0);
   const growthPct = Math.max(model.growth_floor, Math.min(model.growth_cap, weekChange));
@@ -212,8 +279,7 @@ export function impliedValue(
   const chainBonus = Math.max(0, Math.min(protocol.chains.length - 1, model.chain_max_steps));
   const chainFactor = 1 + chainBonus * model.chain_step;
   const sizedValue = protocol.tvl_usd * model.base_multiple;
-  const implied = Math.max(1, Math.round(sizedValue * growthFactor * maturityFactor * chainFactor));
-  return { implied, growthPct, growthMult: growthFactor, maturityMult: maturityFactor, chainMult: chainFactor, age: protocolAge };
+  return Math.max(1, Math.round(sizedValue * growthFactor * maturityFactor * chainFactor));
 }
 
 /** DefiLlama's version-marker test: a name ending in a release is another protocol's pool. */
@@ -272,6 +338,10 @@ function round4(n: number): number {
   return Math.round(n * 10000) / 10000;
 }
 
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
 /** The board's protocols, strongest first, ranked 1..n. */
 export function buildBoard(
   snapshot: Snapshot,
@@ -296,8 +366,28 @@ export function buildBoard(
     .sort((x, y) => y.tvl_usd - x.tvl_usd || (x.slug < y.slug ? -1 : x.slug > y.slug ? 1 : 0));
   for (const entry of newcomers) picked.set(entry.slug, entry);
 
-  const scored = [...picked.values()].map((entry) => {
-    const result = impliedValue(entry, snapshot.as_of, model);
+  // The radar-3 anchors are board-wide figures, so they are computed over the picked rows
+  // before any row is scored: the median TVL of the whole board, and the median seven-day
+  // change inside each category. Every row then scores against the same anchors.
+  const pickedRows = [...picked.values()];
+  const tvlMedian = median(pickedRows.map((entry) => entry.tvl_usd).sort((a, b) => a - b)) ?? 0;
+  const growthByCategory = new Map<string, number[]>();
+  for (const entry of pickedRows) {
+    if (entry.change_7d === null) continue;
+    const key = entry.category ?? 'Other';
+    const values = growthByCategory.get(key) ?? [];
+    values.push(entry.change_7d);
+    growthByCategory.set(key, values);
+  }
+  const categoryMedian = new Map<string, number>();
+  for (const [key, values] of growthByCategory) {
+    const med = median(values.sort((a, b) => a - b));
+    if (med !== null) categoryMedian.set(key, med);
+  }
+  const ctx: ModelContext = { tvlMedian, categoryMedian };
+
+  const scored = pickedRows.map((entry) => {
+    const result = impliedValue(entry, snapshot.as_of, model, ctx);
     return { entry, ...result };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.entry.slug < b.entry.slug ? -1 : a.entry.slug > b.entry.slug ? 1 : 0));
@@ -308,9 +398,9 @@ export function buildBoard(
     listed_at: item.entry.listed_at, gecko_id: item.entry.gecko_id, symbol: item.entry.symbol,
     token_status: 'pre-token', age_days: item.age, implied_value_usd: item.implied,
     model: {
-      base_multiple: model.base_multiple, growth_pct: item.growthPct,
-      growth_multiplier: round4(item.growthMult), maturity_multiplier: round4(item.maturityMult),
-      chain_multiplier: round4(item.chainMult), age_days: item.age,
+      tvl_base: round2(item.tvlBase), growth_factor: round4(item.growthFactor),
+      category_median_7d: item.categoryMedian, chain_factor: round4(item.chainFactor),
+      tvl_median: tvlMedian,
     },
     farm_steps: farmSteps(item.entry, item.age).map(stepText),
   }));
@@ -350,9 +440,10 @@ function capitalFor(entry: SnapshotProtocol): number {
   return defaultCapital;
 }
 
-/** Gas for one setup transaction, priced by the chain it runs on. */
-function gasFor(entry: SnapshotProtocol): number {
-  return chainOf(entry) === 'Ethereum' ? 12 : 4;
+/** Gas for one setup transaction, as an estimate range by chain: gas moves with the network,
+ * so the plan quotes a range, never a flat fee it cannot know. */
+function gasRange(entry: SnapshotProtocol): string {
+  return chainOf(entry) === 'Ethereum' ? '$8-15' : '$1-5';
 }
 
 /** Hold length from the protocol's age: younger ones get a longer window. */
@@ -407,15 +498,15 @@ function actionFor(entry: SnapshotProtocol, capital: number, chain: string): str
   if (kind.includes('lend') || kind.includes('collateral')) return 'Supply $' + capital + ' of USDC to ' + label + ' on ' + chain + ', borrow a small amount against it, and keep the health factor above the liquidation line.';
   if (kind.includes('interest rate')) return 'Deposit $' + capital + ' of USDC as margin for one interest-rate position on ' + label + ' on ' + chain + ', and close it before the rate leg moves against you.';
   if (kind.includes('perpetual') || kind.includes('derivative')) return 'Deposit $' + capital + ' of USDC as margin on ' + label + ' on ' + chain + ', open one small hedged position, and set a stop so it closes before liquidation.';
-  if (kind.includes('basis')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s basis vault on ' + chain + ' and hold the delta-neutral position while funding stays positive.';
-  if (kind.includes('options')) return 'Deposit $' + capital + ' of USDC into an options vault on ' + label + ' on ' + chain + ' and hold the vault shares through one expiry.';
-  if (kind.includes('leveraged farm')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s leveraged farm on ' + chain + ' at the lowest leverage it offers, and watch the borrow rate daily.';
-  if (kind.includes('dex')) return 'Provide $' + capital + ' of liquidity to ' + label + '\'s main USDC pair on ' + chain + ', keeping the position in range, and collect the trading fees.';
-  if (kind.includes('liquidity manager')) return 'Deposit $' + capital + ' of USDC into a ' + label + ' managed vault on ' + chain + ' and let the manager rebalance the range; keep the shares.';
-  if (kind.includes('yield aggregator')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s largest vault on ' + chain + ' and keep the shares while the strategy runs.';
-  if (kind.includes('yield')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s yield vault on ' + chain + ' and keep the shares while the yield runs.';
-  if (kind.includes('curator')) return 'Deposit $' + capital + ' of USDC into a ' + label + ' curated vault on ' + chain + ' and keep the vault shares; the curator picks the underlying markets, not you.';
-  if (kind.includes('allocator')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s allocator vault on ' + chain + ' and let it rotate the funds between strategies.';
+  if (kind.includes('basis')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s basis vault on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and hold the delta-neutral position while funding stays positive.';
+  if (kind.includes('options')) return 'Deposit $' + capital + ' of USDC into an options vault on ' + label + ' on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and hold the vault shares through one expiry.';
+  if (kind.includes('leveraged farm')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s leveraged farm on ' + chain + ' (confirm the farm exists on the protocol\'s own page first) at the lowest leverage it offers, and watch the borrow rate daily.';
+  if (kind.includes('dex')) return 'Provide $' + capital + ' of liquidity to ' + label + '\'s main pool on ' + chain + ' (confirm the pool exists on the protocol\'s own page first), keeping the position in range, and collect the trading fees.';
+  if (kind.includes('liquidity manager')) return 'Deposit $' + capital + ' of USDC into a ' + label + ' managed vault on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and let the manager rebalance the range; keep the shares.';
+  if (kind.includes('yield aggregator')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s main vault on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and keep the shares while the strategy runs.';
+  if (kind.includes('yield')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s yield vault on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and keep the shares while the yield runs.';
+  if (kind.includes('curator')) return 'Deposit $' + capital + ' of USDC into a ' + label + ' curated vault on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and keep the vault shares; the curator picks the underlying markets, not you.';
+  if (kind.includes('allocator')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s allocator vault on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and let it rotate the funds between strategies.';
   if (kind.includes('restak')) return 'Restake $' + capital + ' of the receipt token through ' + label + ' on ' + chain + ' and keep the restaking receipt.';
   if (kind.includes('staking')) return 'Stake $' + capital + ' of the chain\'s staking asset through ' + label + ' on ' + chain + ' and keep the receipt token.';
   if (kind.includes('bridge')) return 'Bridge $' + capital + ' of USDC to ' + chain + ' through ' + label + ' and use the bridged funds in its app the same week.';
@@ -429,7 +520,7 @@ function actionFor(entry: SnapshotProtocol, capital: number, chain: string): str
   if (kind.includes('launchpad')) return 'Join one ' + label + ' launch with $' + capital + ' on ' + chain + ' and hold the allocation through the lock-up.';
   if (kind.includes('token locker')) return 'Lock $' + capital + ' of an asset in ' + label + ' on ' + chain + ' for the shortest term it offers.';
   if (kind.includes('otc')) return 'Place one OTC trade of $' + capital + ' through ' + label + ' on ' + chain + ' and keep the trade receipt.';
-  if (kind.includes('cedefi')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s CeDeFi vault on ' + chain + ' and keep the position open; the vault runs off-chain strategies.';
+  if (kind.includes('cedefi')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s CeDeFi vault on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and keep the position open; the vault runs off-chain strategies.';
   if (kind.includes('payment')) return 'Pay or receive $' + capital + ' through ' + label + ' on ' + chain + ' and keep the payment receipt.';
   if (kind.includes('governance')) return 'Lock $' + capital + ' of the governance asset through ' + label + ' on ' + chain + ' and cast one vote in its next proposal.';
   if (kind.includes('card')) return 'Spend $' + capital + ' through a ' + label + ' card on ' + chain + ' and keep the statement for the farm log.';
@@ -500,16 +591,16 @@ export function farmSteps(
   const firstChain = chainOf(entry);
   const secondChain = secondChainOf(entry);
   const stake = capitalFor(entry);
-  const gas = gasFor(entry);
+  const gas = gasRange(entry);
   const holdDays = holdDaysFor(age);
   const secondChainClause = secondChain === null ? '' : ' Alternate weeks between ' + firstChain + ' and ' + secondChain + ' so both chains show activity.';
   const youngClause = age !== null && age < 90 ? ' The protocol is only ' + age + ' days old, so check its announcements weekly too.' : '';
   const logSecond = secondChain === null ? '' : ' Note the second chain, ' + secondChain + ', if you farmed there too.';
   const mk = (text: string, cost: string, time: string): FarmStep => ({ text, cost, time });
   const plan: FarmStep[] = [
-    mk('Set up a fresh wallet on ' + firstChain + ' with $' + stake + ' of USDC and about $' + gas + ' for gas, and keep its seed phrase offline. ' + growthNote(entry), 'about $' + gas + ' of gas to fund the wallet', '10 minutes'),
-    mk(actionFor(entry, stake, firstChain), '$' + stake + ' of capital and about $' + gas + ' of gas', '15 minutes to set up'),
-    mk('Do one qualifying action each week, such as ' + weeklyActionFor(entry) + ', so the wallet reads as active rather than one-off.' + secondChainClause + youngClause, 'about $2 of gas a week', '10 minutes a week'),
+    mk('Set up a fresh wallet on ' + firstChain + ' with $' + stake + ' of USDC and gas money of roughly ' + gas + ' (an estimate, gas moves with the network), and keep its seed phrase offline. ' + growthNote(entry), 'gas of roughly ' + gas + ' (estimate) to fund the wallet', '10 minutes'),
+    mk(actionFor(entry, stake, firstChain), '$' + stake + ' of capital and gas of roughly ' + gas + ' (estimate)', '15 minutes to set up'),
+    mk('Do one qualifying action each week, such as ' + weeklyActionFor(entry) + ', so the wallet reads as active rather than one-off.' + secondChainClause + youngClause, 'a few dollars of gas a week', '10 minutes a week'),
     mk('Hold the position for at least ' + holdDays + ' days so the activity is counted in more than one snapshot. ' + ageNote(age, holdDays) + ' TVL is ' + fmtTvl(entry.tvl_usd) + ', so your $' + stake + ' position is a small share of the pool.', 'the $' + stake + ' stays in the position', holdDays + ' days'),
     mk(checkActionFor(entry, firstChain) + ' Claim only from the link the protocol itself publishes, and never pay to claim.', 'no fee to check, and never pay to claim', '10 minutes'),
     mk('Write the wallet, the dates and every transaction in a farm log: ' + entry.name + ' on ' + firstChain + ', $' + stake + ' entered, hold ends after ' + holdDays + ' days.' + logSecond, 'nothing but the log', '5 minutes'),
@@ -544,6 +635,8 @@ export function radarRow(
   tvlRank: number | null,
   growthMedian: number | null,
   isListed: boolean,
+  v2Rank: number,
+  v2Implied: number,
 ): RadarRow {
   const out: RadarRow = {
     rank: boardRow.rank, slug: boardRow.slug, name: boardRow.name,
@@ -551,13 +644,127 @@ export function radarRow(
     change_7d: boardRow.change_7d, mcap_usd: boardRow.mcap_usd,
     listed_at: boardRow.listed_at, age_days: boardRow.age_days,
     implied_value_usd: boardRow.implied_value_usd,
-    growth_multiplier: boardRow.model.growth_multiplier,
-    maturity_multiplier: boardRow.model.maturity_multiplier,
-    chain_multiplier: boardRow.model.chain_multiplier,
+    growth_factor: boardRow.model.growth_factor,
+    chain_factor: boardRow.model.chain_factor,
+    tvl_base: boardRow.model.tvl_base,
+    category_median_7d: boardRow.model.category_median_7d,
+    tvl_median: boardRow.model.tvl_median,
+    v2_rank: v2Rank, v2_implied: v2Implied,
     category_tvl_rank: tvlRank, category_growth_median: growthMedian,
     on_watchlist: isListed,
   };
   return out;
+}
+
+/** Spearman rank correlation between two rankings of the same rows, each 1..n. */
+function spearman(v2Rank: Map<string, number>, v4Rank: Map<string, number>): number {
+  const n = v2Rank.size;
+  if (n < 2) return 1;
+  let squared = 0;
+  for (const [slug, r2] of v2Rank) {
+    const r4 = v4Rank.get(slug) ?? 0;
+    squared += (r2 - r4) * (r2 - r4);
+  }
+  return Math.round((1 - (6 * squared) / (n * (n * n - 1))) * 10000) / 10000;
+}
+
+/**
+ * The four ratios that carry a row from its radar-2 value to its radar-3 value: their product
+ * is exactly implied_v3 / implied_v2. Growth is the category-relative tanh factor over the old
+ * clamped factor; compression is the sub-linear base over the old linear one; age is the old
+ * maturity factor dropped; chain is the 3% step over the old 4%.
+ */
+function changeRatios(
+  row: BoardRow,
+  tvlMedian: number,
+): { growth: number; compression: number; age: number; chain: number } {
+  const change = row.change_7d === null ? 0 : row.change_7d;
+  const clamped = Math.max(MODEL_V2.growth_floor, Math.min(MODEL_V2.growth_cap, change));
+  const growthV2 = 1 + (clamped / 100) * MODEL_V2.growth_weight;
+  const growth = row.model.growth_factor / growthV2;
+  const compression = Math.pow(tvlMedian / row.tvl_usd, 0.15);
+  const ageForModel = row.age_days === null ? MODEL_V2.unknown_age_days : row.age_days;
+  const cappedAge = Math.max(0, Math.min(ageForModel, MODEL_V2.maturity_days));
+  const maturityV2 = MODEL_V2.maturity_floor + (cappedAge / MODEL_V2.maturity_days) * MODEL_V2.maturity_range;
+  const age = 1 / maturityV2;
+  const chainBonus = Math.max(0, Math.min(row.chains.length - 1, MODEL_V2.chain_max_steps));
+  const chainV2 = 1 + chainBonus * MODEL_V2.chain_step;
+  const chain = row.model.chain_factor / chainV2;
+  return { growth, compression, age, chain };
+}
+
+/** One line saying which factor drove a row's move between the releases. Each factor is measured
+ * against the board median of that factor, so the reason names what moved this row relative to
+ * the board, not what moved the whole board. */
+function moveReason(
+  row: BoardRow,
+  ratios: { growth: number; compression: number; age: number; chain: number },
+  medians: { growth: number; compression: number; age: number; chain: number },
+  movedUp: boolean,
+): string {
+  const relative = {
+    growth: ratios.growth / medians.growth,
+    compression: ratios.compression / medians.compression,
+    age: ratios.age / medians.age,
+    chain: ratios.chain / medians.chain,
+  };
+  const entries: Array<[string, number]> = [['growth', relative.growth], ['compression', relative.compression], ['age', relative.age], ['chain', relative.chain]];
+  const inDirection = entries.filter(([, value]) => (movedUp ? value > 1 : value < 1));
+  const pick = (inDirection.length > 0 ? inDirection : entries)
+    .sort((a, b) => Math.abs(Math.log(b[1])) - Math.abs(Math.log(a[1])))[0]!;
+  const kind = pick[0];
+  const change = row.change_7d;
+  const catMedian = row.model.category_median_7d;
+  if (kind === 'growth') {
+    if (change === null || catMedian === null) return 'No seven-day change on record, so the growth factor scores 1 while other rows move on theirs.';
+    const clamped = Math.max(MODEL_V2.growth_floor, Math.min(MODEL_V2.growth_cap, change));
+    const growthV2 = 1 + (clamped / 100) * MODEL_V2.growth_weight;
+    if (movedUp) return 'Outgrew its category: seven-day change ' + fmtPct(change) + ' against a ' + (row.category ?? 'Other') + ' median of ' + fmtPct(catMedian) + ' (growth ' + row.model.growth_factor.toFixed(2) + 'x, where radar-2 paid ' + growthV2.toFixed(2) + 'x).';
+    if (growthV2 >= 1.5) return 'The seven-day spike radar-2 rewarded at ' + growthV2.toFixed(2) + 'x is capped at ' + row.model.growth_factor.toFixed(2) + 'x under radar-3: seven-day change ' + fmtPct(change) + ' against a ' + (row.category ?? 'Other') + ' median of ' + fmtPct(catMedian) + '.';
+    return 'Lagged its category: seven-day change ' + fmtPct(change) + ' against a ' + (row.category ?? 'Other') + ' median of ' + fmtPct(catMedian) + ' (growth ' + row.model.growth_factor.toFixed(2) + 'x, where radar-2 paid ' + growthV2.toFixed(2) + 'x).';
+  }
+  if (kind === 'compression') {
+    if (movedUp) return 'Small TVL: the sub-linear base lifts it against the old linear TVL.';
+    return 'Large TVL: the sub-linear base compresses it against the old linear TVL.';
+  }
+  if (kind === 'age') {
+    if (movedUp) return 'Young protocol: radar-3 drops the age discount, so it is no longer held back for being ' + (row.age_days === null ? 'unlisted' : String(row.age_days)) + ' days old.';
+    return 'Old protocol: at ' + (row.age_days === null ? 'unlisted' : String(row.age_days)) + ' days it gets no lift from the age discount being dropped, while younger protocols around it rise.';
+  }
+  return 'Chain breadth: the chain step fell from 4% to 3%, so extra chains count for less than they did.';
+}
+
+/** The radar-2 versus radar-3 comparison: Spearman correlation and the biggest movers. */
+function buildComparison(
+  ranked: BoardRow[],
+  v2RankBySlug: Map<string, number>,
+): ModelComparison {
+  const v4RankBySlug = new Map<string, number>();
+  ranked.forEach((row, i) => v4RankBySlug.set(row.slug, i + 1));
+  const spearmanValue = spearman(v2RankBySlug, v4RankBySlug);
+  const tvlMedian = ranked[0]?.model.tvl_median ?? 0;
+  const ratiosBySlug = new Map<string, { growth: number; compression: number; age: number; chain: number }>();
+  for (const row of ranked) ratiosBySlug.set(row.slug, changeRatios(row, tvlMedian));
+  const medians = {
+    growth: median([...ratiosBySlug.values()].map((r) => r.growth).sort((a, b) => a - b)) ?? 1,
+    compression: median([...ratiosBySlug.values()].map((r) => r.compression).sort((a, b) => a - b)) ?? 1,
+    age: median([...ratiosBySlug.values()].map((r) => r.age).sort((a, b) => a - b)) ?? 1,
+    chain: median([...ratiosBySlug.values()].map((r) => r.chain).sort((a, b) => a - b)) ?? 1,
+  };
+  const movers = ranked.map((row) => {
+    const v2Rank = v2RankBySlug.get(row.slug) ?? 0;
+    const delta = v2Rank - row.rank;
+    return {
+      slug: row.slug, name: row.name, v2_rank: v2Rank, v4_rank: row.rank,
+      reason: moveReason(row, ratiosBySlug.get(row.slug)!, medians, delta > 0),
+      delta,
+    };
+  });
+  const rises = movers.filter((m) => m.delta > 0).sort((a, b) => b.delta - a.delta || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0)).slice(0, 5)
+    .map(({ slug, name, v2_rank, v4_rank, reason }) => ({ slug, name, v2_rank, v4_rank, reason }));
+  const falls = movers.filter((m) => m.delta < 0).sort((a, b) => a.delta - b.delta || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0)).slice(0, 5)
+    .map(({ slug, name, v2_rank, v4_rank, reason }) => ({ slug, name, v2_rank, v4_rank, reason }));
+  return { spearman: spearmanValue, rises, falls };
 }
 
 /** The dashboard's dataset, built from the snapshot. */
@@ -568,6 +775,18 @@ export function buildRadar(
   const ranked = buildBoard(snapshot, model);
   const liveSet = liveRows(snapshot);
   const early = ranked.filter((r) => snapshot.watchlist.includes(r.slug) === false).length;
+  // The radar-2 comparison: score the same rows with the old function and rank them the same
+  // way (implied value down, slug up), so the two releases can be set side by side.
+  const lookup = bySlug(snapshot.protocols);
+  const v2Implied = new Map<string, number>();
+  for (const row of ranked) {
+    const entry = lookup.get(row.slug);
+    if (entry !== undefined) v2Implied.set(row.slug, impliedValueV2(entry, snapshot.as_of));
+  }
+  const v2Order = [...ranked].sort((a, b) => (v2Implied.get(b.slug) ?? 0) - (v2Implied.get(a.slug) ?? 0) || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  const v2RankBySlug = new Map<string, number>();
+  v2Order.forEach((row, i) => v2RankBySlug.set(row.slug, i + 1));
+  const comparison = buildComparison(ranked, v2RankBySlug);
   // Category standings, built from the board's own rows: TVL rank inside the category, plus the
   // category's median seven-day growth across the rows that report one. Deterministic: ties break
   // on slug, the same order the board uses.
@@ -597,9 +816,10 @@ export function buildRadar(
     early_size: early, live_size: liveSet.length,
     rows: ranked.map((row) => {
       const standing = standingBySlug.get(row.slug) ?? { tvlRank: 0, growthMedian: null };
-      return radarRow(row, standing.tvlRank === 0 ? null : standing.tvlRank, standing.growthMedian, snapshot.watchlist.includes(row.slug));
+      return radarRow(row, standing.tvlRank === 0 ? null : standing.tvlRank, standing.growthMedian, snapshot.watchlist.includes(row.slug), v2RankBySlug.get(row.slug) ?? 0, v2Implied.get(row.slug) ?? 0);
     }),
     live: liveSet,
+    comparison,
   };
   return { board: ranked, radar: radarData };
 }

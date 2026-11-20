@@ -331,6 +331,11 @@ function chainOf(entry: SnapshotProtocol): string {
   return entry.chains[0] ?? 'its main chain';
 }
 
+/** A protocol's second named chain, or null when it runs on one chain. */
+function secondChainOf(entry: SnapshotProtocol): string | null {
+  return entry.chains[1] ?? null;
+}
+
 /** Capital for one farm position, sized from the protocol's own TVL. */
 function capitalFor(entry: SnapshotProtocol): number {
   const defaultCapital = 50;
@@ -345,85 +350,170 @@ function capitalFor(entry: SnapshotProtocol): number {
   return defaultCapital;
 }
 
+/** Gas for one setup transaction, priced by the chain it runs on. */
+function gasFor(entry: SnapshotProtocol): number {
+  return chainOf(entry) === 'Ethereum' ? 12 : 4;
+}
+
 /** Hold length from the protocol's age: younger ones get a longer window. */
 function holdDaysFor(ageInDays: number | null): number {
   return ageInDays === null ? 30 : ageInDays < 180 ? 60 : ageInDays < 365 ? 45 : 30;
 }
 
+/** A TVL figure as the dashboard prints it: $2.75B, $376.0M, $5.0M, $850K. */
+function fmtTvl(value: number): string {
+  if (value >= 1e9) return '$' + (value / 1e9).toFixed(2) + 'B';
+  if (value >= 1e6) return '$' + (value / 1e6).toFixed(1) + 'M';
+  if (value >= 1e3) return '$' + Math.round(value / 1e3) + 'K';
+  return '$' + Math.round(value);
+}
+
+/** A seven-day change as signed per cent, two decimals. */
+function fmtPct(value: number): string {
+  return (value > 0 ? '+' : '') + value.toFixed(2) + '%';
+}
+
+/** Entry timing from the protocol's own seven-day TVL change. */
+function growthNote(entry: SnapshotProtocol): string {
+  const change = entry.change_7d;
+  if (change === null) return 'The snapshot carries no seven-day change, so enter at the standard size and let the first month set the pace.';
+  if (change >= 20) return 'TVL is up ' + fmtPct(change) + ' in seven days, so fund the position this week while the growth is fresh.';
+  if (change >= 5) return 'TVL is up ' + fmtPct(change) + ' in seven days, so enter now rather than waiting for a pullback.';
+  if (change > -5) return 'TVL is near flat over seven days (' + fmtPct(change) + '), so there is no rush to fund it all at once.';
+  if (change > -20) return 'TVL is down ' + fmtPct(change) + ' in seven days, so fund half now and the rest only after the decline flattens.';
+  return 'TVL is down ' + fmtPct(change) + ' in seven days, so start with half the capital and wait for two flat snapshots before adding.';
+}
+
+/** What the hold is for, from the protocol's own age. */
+function ageNote(ageInDays: number | null, hold: number): string {
+  if (ageInDays === null) return 'The snapshot carries no listing date, so treat the hold as the full ' + hold + ' days.';
+  if (ageInDays < 90) return 'It was listed only ' + ageInDays + ' days ago, so the full ' + hold + '-day hold matters: a young protocol is judged on more than one snapshot.';
+  if (ageInDays < 365) return 'It has run ' + ageInDays + ' days with no token, so hold the full ' + hold + ' days to cross another snapshot cycle.';
+  return 'It has run ' + ageInDays + ' days with no token, so the hold is about the snapshot cycle, not about waiting on the team.';
+}
+
 /**
  * One action for the category, worded so a farmer can follow it. The category comes from the
  * snapshot's own field, and the action is derived the same way for every protocol of that kind.
+ * Each branch names the asset, the venue and the chain, and adds the mechanic that makes the
+ * kind different: the borrow for a lender, the hedge for a perp, the receipt for a staker.
  * Never a token name, never a promised airdrop: the plan farms the protocol as it stands.
  */
 function actionFor(entry: SnapshotProtocol, capital: number, chain: string): string {
   const kind = (entry.category ?? '').toLowerCase();
   const label = entry.name;
-  if (kind.includes('lend') || kind.includes('cdp') || kind.includes('collateral')) return 'Supply $' + capital + ' of USDC to ' + label + ' on ' + chain + ', borrow a small amount against it, and keep both sides open.';
-  if (kind.includes('perpetual') || kind.includes('derivative')) return 'Deposit $' + capital + ' of USDC as margin on ' + label + ', open one small hedge, and close it before it can liquidate.';
-  if (kind.includes('basis')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s basis vault on ' + chain + ' and hold the delta-neutral position.';
-  if (kind.includes('options')) return 'Deposit $' + capital + ' of USDC into an options vault on ' + label + ' and hold the vault shares.';
-  if (kind.includes('dex') || kind.includes('leveraged farm')) return 'Provide $' + capital + ' of liquidity to ' + label + '\'s main pool on ' + chain + ' and keep the position open.';
-  if (kind.includes('liquidity manager')) return 'Deposit $' + capital + ' of USDC into a ' + label + ' managed vault on ' + chain + ' and keep the shares.';
-  if (kind.includes('yield aggregator') || kind.includes('yield')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s highest-TVL vault on ' + chain + ' and keep the shares.';
-  if (kind.includes('curator') || kind.includes('allocator')) return 'Deposit $' + capital + ' into a ' + label + ' vault on ' + chain + ' and keep the shares.';
-  if (kind.includes('staking') || kind.includes('restak')) return 'Stake $' + capital + ' of the chain\'s staking asset through ' + label + ' and keep the receipt token.';
-  if (kind.includes('bridge')) return 'Bridge $' + capital + ' of USDC to ' + chain + ' through ' + label + ' and use the bridged funds in its app.';
-  if (kind.includes('chain')) return 'Bridge $' + capital + ' of USDC to ' + label + ' and use two of its native apps in the same week.';
-  if (kind.includes('rwa')) return 'Mint $' + capital + ' of the protocol\'s yield-bearing asset on ' + chain + ' and hold it.';
-  if (kind.includes('stable')) return 'Mint or deposit $' + capital + ' of the stable asset through ' + label + ' on ' + chain + ' and hold it.';
-  if (kind.includes('btc')) return 'Deposit $' + capital + ' of BTC through ' + label + ' on ' + chain + ' and keep the receipt.';
-  if (kind.includes('prediction')) return 'Fund $' + capital + ' and place one market position on ' + label + ', then settle it.';
-  if (kind.includes('insurance')) return 'Buy $' + capital + ' of cover from ' + label + ' on ' + chain + ' and keep the policy open.';
-  if (kind.includes('launchpad')) return 'Join one ' + label + ' launch with $' + capital + ' on ' + chain + ' and hold the allocation.';
+  if (kind.includes('uncollateralized')) return 'Lend $' + capital + ' of USDC through ' + label + ' on ' + chain + ' to its borrower pool and keep the loan receipts.';
+  if (kind.includes('cdp')) return 'Lock $' + capital + ' of USDC as collateral in ' + label + ' on ' + chain + ', mint the stablecoin it issues against it, and keep the collateral ratio above the liquidation line.';
+  if (kind.includes('lend') || kind.includes('collateral')) return 'Supply $' + capital + ' of USDC to ' + label + ' on ' + chain + ', borrow a small amount against it, and keep the health factor above the liquidation line.';
+  if (kind.includes('interest rate')) return 'Deposit $' + capital + ' of USDC as margin for one interest-rate position on ' + label + ' on ' + chain + ', and close it before the rate leg moves against you.';
+  if (kind.includes('perpetual') || kind.includes('derivative')) return 'Deposit $' + capital + ' of USDC as margin on ' + label + ' on ' + chain + ', open one small hedged position, and set a stop so it closes before liquidation.';
+  if (kind.includes('basis')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s basis vault on ' + chain + ' and hold the delta-neutral position while funding stays positive.';
+  if (kind.includes('options')) return 'Deposit $' + capital + ' of USDC into an options vault on ' + label + ' on ' + chain + ' and hold the vault shares through one expiry.';
+  if (kind.includes('leveraged farm')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s leveraged farm on ' + chain + ' at the lowest leverage it offers, and watch the borrow rate daily.';
+  if (kind.includes('dex')) return 'Provide $' + capital + ' of liquidity to ' + label + '\'s main USDC pair on ' + chain + ', keeping the position in range, and collect the trading fees.';
+  if (kind.includes('liquidity manager')) return 'Deposit $' + capital + ' of USDC into a ' + label + ' managed vault on ' + chain + ' and let the manager rebalance the range; keep the shares.';
+  if (kind.includes('yield aggregator')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s largest vault on ' + chain + ' and keep the shares while the strategy runs.';
+  if (kind.includes('yield')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s yield vault on ' + chain + ' and keep the shares while the yield runs.';
+  if (kind.includes('curator')) return 'Deposit $' + capital + ' of USDC into a ' + label + ' curated vault on ' + chain + ' and keep the vault shares; the curator picks the underlying markets, not you.';
+  if (kind.includes('allocator')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s allocator vault on ' + chain + ' and let it rotate the funds between strategies.';
+  if (kind.includes('restak')) return 'Restake $' + capital + ' of the receipt token through ' + label + ' on ' + chain + ' and keep the restaking receipt.';
+  if (kind.includes('staking')) return 'Stake $' + capital + ' of the chain\'s staking asset through ' + label + ' on ' + chain + ' and keep the receipt token.';
+  if (kind.includes('bridge')) return 'Bridge $' + capital + ' of USDC to ' + chain + ' through ' + label + ' and use the bridged funds in its app the same week.';
+  if (kind.includes('chain')) return 'Bridge $' + capital + ' of USDC to ' + label + ' and use two of its native apps in the same week, starting with the largest one you can find on its own page.';
+  if (kind.includes('rwa')) return 'Mint $' + capital + ' of the yield-bearing asset through ' + label + ' on ' + chain + ' and hold it; read the backing report on the protocol\'s own page first.';
+  if (kind.includes('wrapper')) return 'Wrap $' + capital + ' of USDC into the wrapped stable through ' + label + ' on ' + chain + ' and hold the wrapped tokens.';
+  if (kind.includes('stable')) return 'Mint or deposit $' + capital + ' of the stable asset through ' + label + ' on ' + chain + ' and hold it through one peg check a week.';
+  if (kind.includes('btc')) return 'Deposit $' + capital + ' of BTC through ' + label + ' on ' + chain + ' and keep the receipt token until the hold ends.';
+  if (kind.includes('prediction')) return 'Fund $' + capital + ' and place one market position on ' + label + ' on ' + chain + ', then settle it when the market resolves.';
+  if (kind.includes('insurance')) return 'Buy $' + capital + ' of cover from ' + label + ' on ' + chain + ' and keep the policy open through the hold.';
+  if (kind.includes('launchpad')) return 'Join one ' + label + ' launch with $' + capital + ' on ' + chain + ' and hold the allocation through the lock-up.';
   if (kind.includes('token locker')) return 'Lock $' + capital + ' of an asset in ' + label + ' on ' + chain + ' for the shortest term it offers.';
-  if (kind.includes('otc')) return 'Place one OTC trade of $' + capital + ' through ' + label + ' on ' + chain + ' and keep the receipt.';
-  if (kind.includes('cedefi')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s CeDeFi vault on ' + chain + ' and keep the position open.';
-  if (kind.includes('payment')) return 'Pay or receive $' + capital + ' through ' + label + ' on ' + chain + ' and keep the receipt.';
-  if (kind.includes('governance')) return 'Lock $' + capital + ' of the governance asset through ' + label + ' on ' + chain + ' and cast one vote.';
-  if (kind.includes('card')) return 'Spend $' + capital + ' through a ' + label + ' card on ' + chain + ' and keep the statement.';
-  if (kind.includes('index')) return 'Buy $' + capital + ' of the ' + label + ' index on ' + chain + ' and hold the shares.';
-  if (kind.includes('farm')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s farm on ' + chain + ' and keep the position open.';
+  if (kind.includes('otc')) return 'Place one OTC trade of $' + capital + ' through ' + label + ' on ' + chain + ' and keep the trade receipt.';
+  if (kind.includes('cedefi')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s CeDeFi vault on ' + chain + ' and keep the position open; the vault runs off-chain strategies.';
+  if (kind.includes('payment')) return 'Pay or receive $' + capital + ' through ' + label + ' on ' + chain + ' and keep the payment receipt.';
+  if (kind.includes('governance')) return 'Lock $' + capital + ' of the governance asset through ' + label + ' on ' + chain + ' and cast one vote in its next proposal.';
+  if (kind.includes('card')) return 'Spend $' + capital + ' through a ' + label + ' card on ' + chain + ' and keep the statement for the farm log.';
+  if (kind.includes('index')) return 'Buy $' + capital + ' of the ' + label + ' index on ' + chain + ' and hold the shares through one rebalance.';
+  if (kind.includes('farm')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s farm on ' + chain + ' and keep the position open through one reward cycle.';
   return 'Deposit $' + capital + ' of USDC into ' + label + ' on ' + chain + ' and keep the position open.';
 }
 
 /** The weekly qualifying action for the protocol's kind; repeated weekly it reads as one farmer. */
 function weeklyActionFor(entry: SnapshotProtocol): string {
   const kind = (entry.category ?? '').toLowerCase();
-  if (kind.includes('perpetual') || kind.includes('derivative') || kind.includes('options') || kind.includes('basis')) return 'one small trade or hedge';
-  if (kind.includes('lend') || kind.includes('cdp') || kind.includes('collateral')) return 'a borrow, a repay or a new supply';
-  if (kind.includes('dex') || kind.includes('liquidity manager')) return 'a swap or a liquidity change';
-  if (kind.includes('prediction')) return 'one market position';
-  if (kind.includes('governance')) return 'a vote or a forum post';
-  if (kind.includes('bridge') || kind.includes('chain')) return 'one bridge or one app interaction';
+  if (kind.includes('interest rate') || kind.includes('perpetual') || kind.includes('derivative') || kind.includes('options') || kind.includes('basis')) return 'one small trade or hedge, and close it before funding eats the margin';
+  if (kind.includes('lend') || kind.includes('cdp') || kind.includes('collateral')) return 'a borrow, a repay or a new supply, and check the health factor each time';
+  if (kind.includes('dex') || kind.includes('liquidity manager')) return 'a swap or a liquidity change in the same pool';
+  if (kind.includes('staking') || kind.includes('restak')) return 'a stake top-up or a rewards check';
+  if (kind.includes('rwa') || kind.includes('stable') || kind.includes('wrapper')) return 'a peg or backing check';
+  if (kind.includes('yield') || kind.includes('curator') || kind.includes('allocator') || kind.includes('farm') || kind.includes('leveraged farm')) return 'a vault deposit or a rewards check';
+  if (kind.includes('prediction')) return 'one market position, settled when the market resolves';
+  if (kind.includes('governance')) return 'a vote or a forum post on the next proposal';
+  if (kind.includes('bridge') || kind.includes('chain')) return 'one bridge or one app interaction on the same chain';
   const fallbackAction = 'a deposit, a swap or a vote';
   return fallbackAction;
 }
 
+/** What to check before claiming anything: the page that shows the position is real. */
+function checkActionFor(entry: SnapshotProtocol, chain: string): string {
+  const kind = (entry.category ?? '').toLowerCase();
+  const label = entry.name;
+  if (kind.includes('lend') || kind.includes('cdp') || kind.includes('collateral')) return 'Open ' + label + '\'s dashboard on ' + chain + ' and check the borrow rate and your health factor.';
+  if (kind.includes('interest rate') || kind.includes('perpetual') || kind.includes('derivative') || kind.includes('options') || kind.includes('basis')) return 'Open ' + label + '\'s trading page on ' + chain + ' and check funding, margin and any open position.';
+  if (kind.includes('dex') || kind.includes('liquidity manager')) return 'Open the pool page on ' + label + ' and check the fees earned and whether the position is still in range.';
+  if (kind.includes('staking') || kind.includes('restak')) return 'Open ' + label + '\'s staking page on ' + chain + ' and check the rewards accrued on your receipt token.';
+  if (kind.includes('rwa') || kind.includes('stable') || kind.includes('wrapper')) return 'Open ' + label + '\'s page on ' + chain + ' and check the peg and the backing report.';
+  if (kind.includes('yield') || kind.includes('curator') || kind.includes('allocator') || kind.includes('farm') || kind.includes('leveraged farm')) return 'Open ' + label + '\'s vault page on ' + chain + ' and check the yield accrued and the vault\'s current strategy.';
+  if (kind.includes('bridge') || kind.includes('chain')) return 'Open ' + label + ' on ' + chain + ' and check the bridged balance arrived before you move on.';
+  if (kind.includes('prediction')) return 'Open ' + label + ' and check whether your market has resolved.';
+  if (kind.includes('governance')) return 'Open ' + label + '\'s governance page on ' + chain + ' and check the next proposal.';
+  if (kind.includes('insurance')) return 'Open ' + label + '\'s cover page on ' + chain + ' and check the policy is still active.';
+  return 'Open ' + label + '\'s own points or rewards page on ' + chain + ' and check what the wallet has earned.';
+}
+
+/** How to unwind, in the order that kind demands: the loan before the supply, the trade before the margin. */
+function exitActionFor(entry: SnapshotProtocol): string {
+  const kind = (entry.category ?? '').toLowerCase();
+  if (kind.includes('lend') || kind.includes('cdp') || kind.includes('collateral')) return 'Repay the borrow first, then withdraw the supply.';
+  if (kind.includes('interest rate') || kind.includes('perpetual') || kind.includes('derivative') || kind.includes('options') || kind.includes('basis')) return 'Close the open position first, then withdraw the margin.';
+  if (kind.includes('dex') || kind.includes('liquidity manager')) return 'Remove the liquidity in one transaction, then check the fees landed.';
+  if (kind.includes('staking') || kind.includes('restak')) return 'Unstake the receipt token and wait out the unbonding period.';
+  if (kind.includes('rwa') || kind.includes('stable') || kind.includes('wrapper')) return 'Redeem the asset back to USDC and check the peg at redemption.';
+  if (kind.includes('yield') || kind.includes('curator') || kind.includes('allocator') || kind.includes('farm') || kind.includes('leveraged farm')) return 'Withdraw the vault shares and check the final yield.';
+  if (kind.includes('bridge') || kind.includes('chain')) return 'Bridge the funds back to your home chain before you close the wallet.';
+  return 'Withdraw the full position in one go.';
+}
+
 /**
  * A protocol's farm plan: seven steps, each an action with a cost and a time, derived from the
- * protocol's own record (category, chains, TVL, age) and never from a hand-written list of names.
- * Nothing here promises a token or an airdrop: the plan farms the protocol as it stands, and
- * the last step is the exit rule.
+ * protocol's own record (category, chains, TVL, seven-day change, age) and never from a
+ * hand-written list of names. The entry step times the funding by the seven-day change, the
+ * weekly step alternates the chains the protocol actually runs on, the hold step is sized by
+ * the protocol's own age and TVL, and the last step is the exit rule, priced by the TVL the
+ * farmer entered at. Nothing here promises a token or an airdrop: the plan farms the protocol
+ * as it stands.
  */
 export function farmSteps(
   entry: SnapshotProtocol,
   age: number | null,
 ): FarmStep[] {
   const firstChain = chainOf(entry);
+  const secondChain = secondChainOf(entry);
   const stake = capitalFor(entry);
+  const gas = gasFor(entry);
   const holdDays = holdDaysFor(age);
-  const firstStep = actionFor(entry, stake, firstChain);
-  const weeklyAction = weeklyActionFor(entry);
-  const gasBudget = stake >= 150 ? 8 : 4;
+  const secondChainClause = secondChain === null ? '' : ' Alternate weeks between ' + firstChain + ' and ' + secondChain + ' so both chains show activity.';
+  const youngClause = age !== null && age < 90 ? ' The protocol is only ' + age + ' days old, so check its announcements weekly too.' : '';
+  const logSecond = secondChain === null ? '' : ' Note the second chain, ' + secondChain + ', if you farmed there too.';
   const mk = (text: string, cost: string, time: string): FarmStep => ({ text, cost, time });
   const plan: FarmStep[] = [
-    mk('Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.', 'under $3 of gas for the first transaction', '5 minutes'),
-    mk(firstStep, '$' + stake + ' of capital and about $' + gasBudget + ' of gas', '15 minutes to set up'),
-    mk('Do one qualifying action each week, such as ' + weeklyAction + ', so the wallet reads as active rather than one-off.', 'about $2 of gas a week', '10 minutes a week'),
-    mk('Hold the position for at least ' + holdDays + ' days so the activity is counted in more than one snapshot.', 'the $' + stake + ' stays in the position', holdDays + ' days'),
-    mk('Before you withdraw, open the protocol\'s own points or rewards page and claim only from the link it publishes.', 'no fee to check, and never pay to claim', '10 minutes'),
-    mk('Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.', 'nothing but the log', '5 minutes'),
-    mk('Recheck the protocol\'s TVL and seven-day growth once a month; if TVL halves from where you entered, unwind the position.', 'nothing to check', '5 minutes a month'),
+    mk('Set up a fresh wallet on ' + firstChain + ' with $' + stake + ' of USDC and about $' + gas + ' for gas, and keep its seed phrase offline. ' + growthNote(entry), 'about $' + gas + ' of gas to fund the wallet', '10 minutes'),
+    mk(actionFor(entry, stake, firstChain), '$' + stake + ' of capital and about $' + gas + ' of gas', '15 minutes to set up'),
+    mk('Do one qualifying action each week, such as ' + weeklyActionFor(entry) + ', so the wallet reads as active rather than one-off.' + secondChainClause + youngClause, 'about $2 of gas a week', '10 minutes a week'),
+    mk('Hold the position for at least ' + holdDays + ' days so the activity is counted in more than one snapshot. ' + ageNote(age, holdDays) + ' TVL is ' + fmtTvl(entry.tvl_usd) + ', so your $' + stake + ' position is a small share of the pool.', 'the $' + stake + ' stays in the position', holdDays + ' days'),
+    mk(checkActionFor(entry, firstChain) + ' Claim only from the link the protocol itself publishes, and never pay to claim.', 'no fee to check, and never pay to claim', '10 minutes'),
+    mk('Write the wallet, the dates and every transaction in a farm log: ' + entry.name + ' on ' + firstChain + ', $' + stake + ' entered, hold ends after ' + holdDays + ' days.' + logSecond, 'nothing but the log', '5 minutes'),
+    mk('Recheck ' + entry.name + '\'s TVL and seven-day growth once a month; if TVL halves from ' + fmtTvl(entry.tvl_usd) + ', unwind the position. ' + exitActionFor(entry), 'nothing to check', '5 minutes a month'),
   ];
   return plan;
 }

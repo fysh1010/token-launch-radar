@@ -69,57 +69,118 @@
   // The farm plan is the same derivation main.ts writes to board.json: category, chains, TVL and
   // age decide the action, the capital, the hold and every cost and time. No name is special-cased.
   function chainOf(p) { return p.chains && p.chains.length > 0 ? p.chains[0] : 'its main chain'; }
+  function secondChainOf(p) { return p.chains && p.chains.length > 1 ? p.chains[1] : null; }
   function capitalFor(p) {
     if (p.tvl_usd >= 5e9) return 250;
     if (p.tvl_usd >= 1e9) return 150;
     if (p.tvl_usd >= 1e8) return 100;
     return 50;
   }
+  function gasFor(p) { return chainOf(p) === 'Ethereum' ? 12 : 4; }
   function holdDaysFor(age) {
     if (age === null || age === undefined) return 30;
     if (age < 180) return 60;
     if (age < 365) return 45;
     return 30;
   }
+  function fmtTvl(n) {
+    if (n >= 1e9) return '$' + (n / 1e9).toFixed(2) + 'B';
+    if (n >= 1e6) return '$' + (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return '$' + Math.round(n / 1e3) + 'K';
+    return '$' + Math.round(n);
+  }
+  function fmtPct(n) { return (n > 0 ? '+' : '') + n.toFixed(2) + '%'; }
+  function growthNote(p) {
+    var change = p.change_7d;
+    if (change === null || change === undefined) return 'The snapshot carries no seven-day change, so enter at the standard size and let the first month set the pace.';
+    if (change >= 20) return 'TVL is up ' + fmtPct(change) + ' in seven days, so fund the position this week while the growth is fresh.';
+    if (change >= 5) return 'TVL is up ' + fmtPct(change) + ' in seven days, so enter now rather than waiting for a pullback.';
+    if (change > -5) return 'TVL is near flat over seven days (' + fmtPct(change) + '), so there is no rush to fund it all at once.';
+    if (change > -20) return 'TVL is down ' + fmtPct(change) + ' in seven days, so fund half now and the rest only after the decline flattens.';
+    return 'TVL is down ' + fmtPct(change) + ' in seven days, so start with half the capital and wait for two flat snapshots before adding.';
+  }
+  function ageNote(age, hold) {
+    if (age === null || age === undefined) return 'The snapshot carries no listing date, so treat the hold as the full ' + hold + ' days.';
+    if (age < 90) return 'It was listed only ' + age + ' days ago, so the full ' + hold + '-day hold matters: a young protocol is judged on more than one snapshot.';
+    if (age < 365) return 'It has run ' + age + ' days with no token, so hold the full ' + hold + ' days to cross another snapshot cycle.';
+    return 'It has run ' + age + ' days with no token, so the hold is about the snapshot cycle, not about waiting on the team.';
+  }
   function actionFor(p, capital, chain) {
     var c = (p.category || '').toLowerCase();
     var name = p.name;
-    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0) return 'Supply $' + capital + ' of USDC to ' + name + ' on ' + chain + ', borrow a small amount against it, and keep both sides open.';
-    if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0) return 'Deposit $' + capital + ' of USDC as margin on ' + name + ', open one small hedge, and close it before it can liquidate.';
-    if (c.indexOf('basis') >= 0) return 'Deposit $' + capital + " of USDC into " + name + "'s basis vault on " + chain + ' and hold the delta-neutral position.';
-    if (c.indexOf('options') >= 0) return 'Deposit $' + capital + ' of USDC into an options vault on ' + name + ' and hold the vault shares.';
-    if (c.indexOf('dex') >= 0 || c.indexOf('leveraged farm') >= 0) return 'Provide $' + capital + ' of liquidity to ' + name + "'s main pool on " + chain + ' and keep the position open.';
-    if (c.indexOf('liquidity manager') >= 0) return 'Deposit $' + capital + ' of USDC into a ' + name + ' managed vault on ' + chain + ' and keep the shares.';
-    if (c.indexOf('yield aggregator') >= 0 || c.indexOf('yield') >= 0) return 'Deposit $' + capital + " of USDC into " + name + "'s highest-TVL vault on " + chain + ' and keep the shares.';
-    if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0) return 'Deposit $' + capital + ' into a ' + name + ' vault on ' + chain + ' and keep the shares.';
-    if (c.indexOf('staking') >= 0 || c.indexOf('restak') >= 0) return "Stake $" + capital + " of the chain's staking asset through " + name + ' and keep the receipt token.';
-    if (c.indexOf('bridge') >= 0) return 'Bridge $' + capital + ' of USDC to ' + chain + ' through ' + name + ' and use the bridged funds in its app.';
-    if (c.indexOf('chain') >= 0) return 'Bridge $' + capital + ' of USDC to ' + name + ' and use two of its native apps in the same week.';
-    if (c.indexOf('rwa') >= 0) return "Mint $" + capital + " of the protocol's yield-bearing asset on " + chain + ' and hold it.';
-    if (c.indexOf('stable') >= 0) return 'Mint or deposit $' + capital + ' of the stable asset through ' + name + ' on ' + chain + ' and hold it.';
-    if (c.indexOf('btc') >= 0) return 'Deposit $' + capital + ' of BTC through ' + name + ' on ' + chain + ' and keep the receipt.';
-    if (c.indexOf('prediction') >= 0) return 'Fund $' + capital + ' and place one market position on ' + name + ', then settle it.';
-    if (c.indexOf('insurance') >= 0) return 'Buy $' + capital + ' of cover from ' + name + ' on ' + chain + ' and keep the policy open.';
-    if (c.indexOf('launchpad') >= 0) return 'Join one ' + name + ' launch with $' + capital + ' on ' + chain + ' and hold the allocation.';
+    if (c.indexOf('uncollateralized') >= 0) return 'Lend $' + capital + ' of USDC through ' + name + ' on ' + chain + ' to its borrower pool and keep the loan receipts.';
+    if (c.indexOf('cdp') >= 0) return 'Lock $' + capital + ' of USDC as collateral in ' + name + ' on ' + chain + ', mint the stablecoin it issues against it, and keep the collateral ratio above the liquidation line.';
+    if (c.indexOf('lend') >= 0 || c.indexOf('collateral') >= 0) return 'Supply $' + capital + ' of USDC to ' + name + ' on ' + chain + ', borrow a small amount against it, and keep the health factor above the liquidation line.';
+    if (c.indexOf('interest rate') >= 0) return 'Deposit $' + capital + ' of USDC as margin for one interest-rate position on ' + name + ' on ' + chain + ', and close it before the rate leg moves against you.';
+    if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0) return 'Deposit $' + capital + ' of USDC as margin on ' + name + ' on ' + chain + ', open one small hedged position, and set a stop so it closes before liquidation.';
+    if (c.indexOf('basis') >= 0) return 'Deposit $' + capital + " of USDC into " + name + "'s basis vault on " + chain + ' and hold the delta-neutral position while funding stays positive.';
+    if (c.indexOf('options') >= 0) return 'Deposit $' + capital + ' of USDC into an options vault on ' + name + ' on ' + chain + ' and hold the vault shares through one expiry.';
+    if (c.indexOf('leveraged farm') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + "'s leveraged farm on " + chain + ' at the lowest leverage it offers, and watch the borrow rate daily.';
+    if (c.indexOf('dex') >= 0) return 'Provide $' + capital + ' of liquidity to ' + name + "'s main USDC pair on " + chain + ', keeping the position in range, and collect the trading fees.';
+    if (c.indexOf('liquidity manager') >= 0) return 'Deposit $' + capital + ' of USDC into a ' + name + ' managed vault on ' + chain + ' and let the manager rebalance the range; keep the shares.';
+    if (c.indexOf('yield aggregator') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + "'s largest vault on " + chain + ' and keep the shares while the strategy runs.';
+    if (c.indexOf('yield') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + "'s yield vault on " + chain + ' and keep the shares while the yield runs.';
+    if (c.indexOf('curator') >= 0) return 'Deposit $' + capital + ' of USDC into a ' + name + ' curated vault on ' + chain + ' and keep the vault shares; the curator picks the underlying markets, not you.';
+    if (c.indexOf('allocator') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + "'s allocator vault on " + chain + ' and let it rotate the funds between strategies.';
+    if (c.indexOf('restak') >= 0) return 'Restake $' + capital + ' of the receipt token through ' + name + ' on ' + chain + ' and keep the restaking receipt.';
+    if (c.indexOf('staking') >= 0) return "Stake $" + capital + " of the chain's staking asset through " + name + ' on ' + chain + ' and keep the receipt token.';
+    if (c.indexOf('bridge') >= 0) return 'Bridge $' + capital + ' of USDC to ' + chain + ' through ' + name + ' and use the bridged funds in its app the same week.';
+    if (c.indexOf('chain') >= 0) return 'Bridge $' + capital + ' of USDC to ' + name + ' and use two of its native apps in the same week, starting with the largest one you can find on its own page.';
+    if (c.indexOf('rwa') >= 0) return 'Mint $' + capital + ' of the yield-bearing asset through ' + name + ' on ' + chain + " and hold it; read the backing report on the protocol's own page first.";
+    if (c.indexOf('wrapper') >= 0) return 'Wrap $' + capital + ' of USDC into the wrapped stable through ' + name + ' on ' + chain + ' and hold the wrapped tokens.';
+    if (c.indexOf('stable') >= 0) return 'Mint or deposit $' + capital + ' of the stable asset through ' + name + ' on ' + chain + ' and hold it through one peg check a week.';
+    if (c.indexOf('btc') >= 0) return 'Deposit $' + capital + ' of BTC through ' + name + ' on ' + chain + ' and keep the receipt token until the hold ends.';
+    if (c.indexOf('prediction') >= 0) return 'Fund $' + capital + ' and place one market position on ' + name + ' on ' + chain + ', then settle it when the market resolves.';
+    if (c.indexOf('insurance') >= 0) return 'Buy $' + capital + ' of cover from ' + name + ' on ' + chain + ' and keep the policy open through the hold.';
+    if (c.indexOf('launchpad') >= 0) return 'Join one ' + name + ' launch with $' + capital + ' on ' + chain + ' and hold the allocation through the lock-up.';
     if (c.indexOf('token locker') >= 0) return 'Lock $' + capital + ' of an asset in ' + name + ' on ' + chain + ' for the shortest term it offers.';
-    if (c.indexOf('otc') >= 0) return 'Place one OTC trade of $' + capital + ' through ' + name + ' on ' + chain + ' and keep the receipt.';
-    if (c.indexOf('cedefi') >= 0) return 'Deposit $' + capital + " of USDC into " + name + "'s CeDeFi vault on " + chain + ' and keep the position open.';
-    if (c.indexOf('payment') >= 0) return 'Pay or receive $' + capital + ' through ' + name + ' on ' + chain + ' and keep the receipt.';
-    if (c.indexOf('governance') >= 0) return 'Lock $' + capital + ' of the governance asset through ' + name + ' on ' + chain + ' and cast one vote.';
-    if (c.indexOf('card') >= 0) return 'Spend $' + capital + ' through a ' + name + ' card on ' + chain + ' and keep the statement.';
-    if (c.indexOf('index') >= 0) return 'Buy $' + capital + ' of the ' + name + ' index on ' + chain + ' and hold the shares.';
-    if (c.indexOf('farm') >= 0) return 'Deposit $' + capital + " of USDC into " + name + "'s farm on " + chain + ' and keep the position open.';
+    if (c.indexOf('otc') >= 0) return 'Place one OTC trade of $' + capital + ' through ' + name + ' on ' + chain + ' and keep the trade receipt.';
+    if (c.indexOf('cedefi') >= 0) return 'Deposit $' + capital + " of USDC into " + name + "'s CeDeFi vault on " + chain + ' and keep the position open; the vault runs off-chain strategies.';
+    if (c.indexOf('payment') >= 0) return 'Pay or receive $' + capital + ' through ' + name + ' on ' + chain + ' and keep the payment receipt.';
+    if (c.indexOf('governance') >= 0) return 'Lock $' + capital + ' of the governance asset through ' + name + ' on ' + chain + ' and cast one vote in its next proposal.';
+    if (c.indexOf('card') >= 0) return 'Spend $' + capital + ' through a ' + name + ' card on ' + chain + ' and keep the statement for the farm log.';
+    if (c.indexOf('index') >= 0) return 'Buy $' + capital + ' of the ' + name + ' index on ' + chain + ' and hold the shares through one rebalance.';
+    if (c.indexOf('farm') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + "'s farm on " + chain + ' and keep the position open through one reward cycle.';
     return 'Deposit $' + capital + ' of USDC into ' + name + ' on ' + chain + ' and keep the position open.';
   }
   function weeklyActionFor(p) {
     var c = (p.category || '').toLowerCase();
-    if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0 || c.indexOf('options') >= 0 || c.indexOf('basis') >= 0) return 'one small trade or hedge';
-    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0) return 'a borrow, a repay or a new supply';
-    if (c.indexOf('dex') >= 0 || c.indexOf('liquidity manager') >= 0) return 'a swap or a liquidity change';
-    if (c.indexOf('prediction') >= 0) return 'one market position';
-    if (c.indexOf('governance') >= 0) return 'a vote or a forum post';
-    if (c.indexOf('bridge') >= 0 || c.indexOf('chain') >= 0) return 'one bridge or one app interaction';
+    if (c.indexOf('interest rate') >= 0 || c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0 || c.indexOf('options') >= 0 || c.indexOf('basis') >= 0) return 'one small trade or hedge, and close it before funding eats the margin';
+    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0) return 'a borrow, a repay or a new supply, and check the health factor each time';
+    if (c.indexOf('dex') >= 0 || c.indexOf('liquidity manager') >= 0) return 'a swap or a liquidity change in the same pool';
+    if (c.indexOf('staking') >= 0 || c.indexOf('restak') >= 0) return 'a stake top-up or a rewards check';
+    if (c.indexOf('rwa') >= 0 || c.indexOf('stable') >= 0 || c.indexOf('wrapper') >= 0) return 'a peg or backing check';
+    if (c.indexOf('yield') >= 0 || c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0 || c.indexOf('farm') >= 0 || c.indexOf('leveraged farm') >= 0) return 'a vault deposit or a rewards check';
+    if (c.indexOf('prediction') >= 0) return 'one market position, settled when the market resolves';
+    if (c.indexOf('governance') >= 0) return 'a vote or a forum post on the next proposal';
+    if (c.indexOf('bridge') >= 0 || c.indexOf('chain') >= 0) return 'one bridge or one app interaction on the same chain';
     return 'a deposit, a swap or a vote';
+  }
+  function checkActionFor(p, chain) {
+    var c = (p.category || '').toLowerCase();
+    var name = p.name;
+    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0) return 'Open ' + name + "'s dashboard on " + chain + ' and check the borrow rate and your health factor.';
+    if (c.indexOf('interest rate') >= 0 || c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0 || c.indexOf('options') >= 0 || c.indexOf('basis') >= 0) return 'Open ' + name + "'s trading page on " + chain + ' and check funding, margin and any open position.';
+    if (c.indexOf('dex') >= 0 || c.indexOf('liquidity manager') >= 0) return 'Open the pool page on ' + name + ' and check the fees earned and whether the position is still in range.';
+    if (c.indexOf('staking') >= 0 || c.indexOf('restak') >= 0) return 'Open ' + name + "'s staking page on " + chain + ' and check the rewards accrued on your receipt token.';
+    if (c.indexOf('rwa') >= 0 || c.indexOf('stable') >= 0 || c.indexOf('wrapper') >= 0) return 'Open ' + name + "'s page on " + chain + ' and check the peg and the backing report.';
+    if (c.indexOf('yield') >= 0 || c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0 || c.indexOf('farm') >= 0 || c.indexOf('leveraged farm') >= 0) return 'Open ' + name + "'s vault page on " + chain + " and check the yield accrued and the vault's current strategy.";
+    if (c.indexOf('bridge') >= 0 || c.indexOf('chain') >= 0) return 'Open ' + name + ' on ' + chain + ' and check the bridged balance arrived before you move on.';
+    if (c.indexOf('prediction') >= 0) return 'Open ' + name + ' and check whether your market has resolved.';
+    if (c.indexOf('governance') >= 0) return 'Open ' + name + "'s governance page on " + chain + ' and check the next proposal.';
+    if (c.indexOf('insurance') >= 0) return 'Open ' + name + "'s cover page on " + chain + ' and check the policy is still active.';
+    return 'Open ' + name + "'s own points or rewards page on " + chain + ' and check what the wallet has earned.';
+  }
+  function exitActionFor(p) {
+    var c = (p.category || '').toLowerCase();
+    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0) return 'Repay the borrow first, then withdraw the supply.';
+    if (c.indexOf('interest rate') >= 0 || c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0 || c.indexOf('options') >= 0 || c.indexOf('basis') >= 0) return 'Close the open position first, then withdraw the margin.';
+    if (c.indexOf('dex') >= 0 || c.indexOf('liquidity manager') >= 0) return 'Remove the liquidity in one transaction, then check the fees landed.';
+    if (c.indexOf('staking') >= 0 || c.indexOf('restak') >= 0) return 'Unstake the receipt token and wait out the unbonding period.';
+    if (c.indexOf('rwa') >= 0 || c.indexOf('stable') >= 0 || c.indexOf('wrapper') >= 0) return 'Redeem the asset back to USDC and check the peg at redemption.';
+    if (c.indexOf('yield') >= 0 || c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0 || c.indexOf('farm') >= 0 || c.indexOf('leveraged farm') >= 0) return 'Withdraw the vault shares and check the final yield.';
+    if (c.indexOf('bridge') >= 0 || c.indexOf('chain') >= 0) return 'Bridge the funds back to your home chain before you close the wallet.';
+    return 'Withdraw the full position in one go.';
   }
   function stepText(step) {
     var s = step.text + ' Cost: ' + step.cost + '. Time: ' + step.time + '.';
@@ -129,18 +190,21 @@
   }
   function farmSteps(p) {
     var chain = chainOf(p);
+    var second = secondChainOf(p);
     var capital = capitalFor(p);
+    var gas = gasFor(p);
     var hold = holdDaysFor(p.age_days);
-    var weekly = weeklyActionFor(p);
-    var gas = capital >= 150 ? 8 : 4;
+    var secondClause = second === null ? '' : ' Alternate weeks between ' + chain + ' and ' + second + ' so both chains show activity.';
+    var youngClause = p.age_days !== null && p.age_days !== undefined && p.age_days < 90 ? ' The protocol is only ' + p.age_days + ' days old, so check its announcements weekly too.' : '';
+    var logSecond = second === null ? '' : ' Note the second chain, ' + second + ', if you farmed there too.';
     return [
-      { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.', cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
+      { text: 'Set up a fresh wallet on ' + chain + ' with $' + capital + ' of USDC and about $' + gas + ' for gas, and keep its seed phrase offline. ' + growthNote(p), cost: 'about $' + gas + ' of gas to fund the wallet', time: '10 minutes' },
       { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + gas + ' of gas', time: '15 minutes to set up' },
-      { text: 'Do one qualifying action each week, such as ' + weekly + ', so the wallet reads as active rather than one-off.', cost: 'about $2 of gas a week', time: '10 minutes a week' },
-      { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
-      { text: "Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes.", cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
-      { text: 'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.', cost: 'nothing but the log', time: '5 minutes' },
-      { text: "Recheck the protocol's TVL and seven-day growth once a month; if TVL halves from where you entered, unwind the position.", cost: 'nothing to check', time: '5 minutes a month' }
+      { text: 'Do one qualifying action each week, such as ' + weeklyActionFor(p) + ', so the wallet reads as active rather than one-off.' + secondClause + youngClause, cost: 'about $2 of gas a week', time: '10 minutes a week' },
+      { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot. ' + ageNote(p.age_days, hold) + ' TVL is ' + fmtTvl(p.tvl_usd) + ', so your $' + capital + ' position is a small share of the pool.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
+      { text: checkActionFor(p, chain) + ' Claim only from the link the protocol itself publishes, and never pay to claim.', cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
+      { text: 'Write the wallet, the dates and every transaction in a farm log: ' + p.name + ' on ' + chain + ', $' + capital + ' entered, hold ends after ' + hold + ' days.' + logSecond, cost: 'nothing but the log', time: '5 minutes' },
+      { text: 'Recheck ' + p.name + '\'s TVL and seven-day growth once a month; if TVL halves from ' + fmtTvl(p.tvl_usd) + ', unwind the position. ' + exitActionFor(p), cost: 'nothing to check', time: '5 minutes a month' }
     ].map(stepText);
   }
 

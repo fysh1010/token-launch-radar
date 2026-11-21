@@ -133,6 +133,10 @@ tbody tr[data-selected="true"] { background: var(--accent-soft); }
 .badge { display: inline-block; font-size: 11px; font-weight: 600; letter-spacing: 0.02em; padding: 1px 7px; border-radius: 999px; margin-left: 6px; vertical-align: 1px; }
 .badge.watch { background: var(--amber-soft); color: var(--amber); }
 .badge.early { background: var(--accent-soft); color: var(--accent); }
+.badge.offlist { background: var(--border); color: var(--ink); }
+
+.odds { margin-bottom: var(--step-5); padding: var(--step-5); display: grid; gap: var(--step-3); }
+.odds .sub { max-width: 78ch; }
 
 .model { margin-top: var(--step-4); padding: var(--step-5); display: grid; gap: var(--step-3); }
 .formula { font-family: var(--font-num); font-size: 13px; line-height: 1.7; color: var(--muted); overflow-wrap: anywhere; }

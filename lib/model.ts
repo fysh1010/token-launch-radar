@@ -1,4 +1,4 @@
-// Token Radar's scoring model, release radar-9: a sealed snapshot goes in, a ranked board comes out.
+// Token Radar's scoring model, release radar-10: a sealed snapshot goes in, a ranked board comes out.
 //
 // Which protocols make the board. The board always carries every slug the snapshot's watchlist
 // names — that list is the floor, never the ceiling — and on top of it the early radar adds
@@ -37,6 +37,14 @@
 //                          traded tokens' leave-one-out predictions — the value scale the
 //                          traded tokens themselves imply, not a round number and not a
 //                          competitor's total.
+//                          Radar-10 adds a second auxiliary: the Radar-3 challenger,
+//                          the v3 complex model re-implemented fresh in
+//                          lib/challenger.ts — round(0.25 x TVL^0.85 x M_c^0.15 x G x C)
+//                          with M_c the RAW category median TVL, not the shrunk anchor.
+//                          The challenger is validated on the same terms as the flat
+//                          champion and the radar-9 formula, and the two-stage rolling
+//                          gate decides whether it takes the board. If it fails, flat
+//                          stays champion and radar-3 stays an auxiliary.
 //   tokenization propensity = sigmoid(w0 + w1 x z(log10 TVL) + w2 x z(chains)
 //                          + w3 x z(category rate)), a logistic score fitted on the eligible
 //                          protocols only — every protocol the board's own visible test keeps,
@@ -81,6 +89,13 @@
 // hand-picked: one function scores every row, and the dashboard prints the formula
 // alongside the constants it runs. The previous release's formula is kept beside it as
 // a comparison function only, never for the ranking.
+
+import {
+  challengerPricedSet,
+  challengerRowFactors,
+  validateChallenger,
+} from './challenger.ts';
+import type { ChallengerValidation } from './challenger.ts';
 
 /** A snapshot protocol entry: the ten fields the sealed input carries, no more. */
 export interface SnapshotProtocol {
@@ -142,7 +157,7 @@ export const MODEL_V2: ModelConstantsV2 = { // radar-2, comparison only
 };
 
 /** The model release label, the one the dashboard shows. */
-export const MODEL_VERSION: string = 'radar-9';
+export const MODEL_VERSION: string = 'radar-10';
 
 /** Live-token rows in the dashboard's Live token view, by market cap. */
 export const LIVE_ROWS: number = 24;
@@ -161,6 +176,26 @@ export interface FarmStep {
  * protocol's quality: a large protocol can top the board and still be a Skip on a small plan,
  * because a small position is a dust share of its drop. */
 export type FarmVerdict = 'Farm' | 'Marginal' | 'Skip';
+
+/** The robust farm verdict, shown SEPARATELY from the farm verdict and never
+ * overwriting it: Base-case Farm when the base case is Farm; Robust Marginal when
+ * the base case is Marginal and it still clears zero at gas +50%; Base-case
+ * Marginal when the base case is Marginal but gas +50% flips it to Skip; Skip
+ * when the base case fails. A Marginal that survives the gas stress test is the
+ * only one that earns "robust" — on this board every Marginal flips, so the
+ * robust count is honestly zero. */
+export type RobustFarmVerdict = 'Base-case Farm' | 'Robust Marginal' | 'Base-case Marginal' | 'Skip';
+
+/** The robust verdict from the base verdict and the gas+50% verdict: the stress
+ * test never changes the verdict, it only labels how much of it survives. */
+export function robustFarmVerdictFor(
+  verdict: FarmVerdict,
+  verdictGas50: FarmVerdict,
+): RobustFarmVerdict {
+  if (verdict === 'Farm') return 'Base-case Farm';
+  if (verdict === 'Marginal') return verdictGas50 === 'Marginal' ? 'Robust Marginal' : 'Base-case Marginal';
+  return 'Skip';
+}
 
 /** How executable a protocol's farm plan is, from the snapshot alone: Category-supported
  * means the snapshot shows a large, long-running protocol in a category with one canonical
@@ -413,6 +448,10 @@ export interface BoardRow {
   flat_rank: number; // the row's rank by flat TVL value alone
   radar_rank: number; // the row's rank by the radar formula alone
   rank_diff: number; // flat_rank minus radar_rank: positive when the radar formula ranks the protocol higher than flat TVL does
+  radar3_value_usd: number; // the Radar-3 challenger's calibrated launch value for the row — an auxiliary valuation, unless the challenger passes the gate and takes the board
+  radar3_rank: number; // the row's rank by the challenger value alone
+  radar3_tvl_median: number; // the challenger's raw category-median TVL anchor for the row, so the page recomputes the challenger value
+  robust_farm_verdict: RobustFarmVerdict; // the farm verdict under the gas stress test, shown separately — never overwrites farm_verdict
   net_1000_usd: number; // conditional net of farming at the $1,000 plan size, neutral 3% drop, assuming launch and a pro-rata drop allocation — not an expected return
   net_10000_usd: number; // conditional net of farming at the $10,000 plan size, neutral 3% drop, same assumption
   net_1000_conservative_usd: number; // conditional net at the $1,000 plan size, conservative 1% drop
@@ -460,6 +499,10 @@ export interface RadarRow {
   flat_rank: number; // the row's rank by flat TVL value alone
   radar_rank: number; // the row's rank by the radar formula alone
   rank_diff: number; // flat_rank minus radar_rank: positive when the radar formula ranks the protocol higher than flat TVL does
+  radar3_value_usd: number; // the Radar-3 challenger's calibrated launch value for the row
+  radar3_rank: number; // the row's rank by the challenger value alone
+  radar3_tvl_median: number; // the challenger's raw category-median TVL anchor for the row, so the page recomputes the challenger value
+  robust_farm_verdict: RobustFarmVerdict; // the farm verdict under the gas stress test, shown separately
   net_1000_usd: number; // conditional net of farming at the $1,000 plan size, neutral 3% drop
   net_10000_usd: number; // conditional net of farming at the $10,000 plan size, neutral 3% drop
   net_1000_conservative_usd: number; // conditional net at the $1,000 plan size, conservative 1% drop
@@ -496,6 +539,40 @@ export interface RankMover {
   v2_rank: number; // rank under radar-2
   current_rank: number; // rank under the current release
   reason: string; // the factor that drove the move, in one line
+}
+
+/** One row of the champion/challenger contest: Flat, Radar-3 and Radar-9 on the
+ * same snapshot, the same 198 ranked rows, the same training sets and splits, the
+ * same two-stage rolling gate, the same nested leave-one-out and the same held-out
+ * range method. The historical dev numbers are reference only — v3 and v8 were
+ * scored in different batches, against different opponents, so they are not a
+ * head-to-head experiment; v11's own dev score stays blank until the platform
+ * scores it after submission. */
+export interface ModelContestRow {
+  model: string; // 'Flat' | 'Radar-3' | 'Radar-9'
+  rolling_pooled_miss: number; // pooled median miss on blocks 1-3
+  rolling_better_123: number | null; // blocks 1-3 better than flat, 0..3 — null for Flat, which cannot beat itself
+  rolling_veto: boolean; // block 4 not more than 10% worse than flat
+  loo_median_miss: number; // median miss, nested leave-one-out
+  bytime_median_miss: number; // median miss, by-time held-out half
+  historical_dev: string | null; // platform dev score from an earlier release, different batch — e.g. '0.881 · 12W/0D/0L (v3)'; null when never submitted as a main board
+  v11_dev: string | null; // null until the platform scores this release
+}
+
+/** The three-model contest: the table, the rank correlations between the models,
+ * and which model the board actually runs. The gate decides the board: the
+ * challenger takes it only when its own two-stage gate passes; a blend takes it
+ * only when a blend passes; otherwise flat stays champion. When both a blend and
+ * the challenger pass, the challenger wins — it is the model this release is
+ * testing, and its pooled miss is the tiebreak the table shows. */
+export interface ModelContest {
+  rows: ModelContestRow[]; // Flat, Radar-3, Radar-9, in that order
+  spearman_flat_radar3: number; // rank correlation between the flat and challenger rankings
+  spearman_flat_radar9: number; // rank correlation between the flat and radar-9 rankings
+  spearman_radar3_radar9: number; // rank correlation between the challenger and radar-9 rankings
+  board_model: 'flat' | 'blend' | 'challenger'; // which model the board actually runs
+  challenger_passed: boolean; // the challenger's two-stage gate result
+  note: string; // the different-batches caveat, printed with the table
 }
 
 /** How the two releases' rankings relate: their correlation and the biggest moves. */
@@ -541,7 +618,9 @@ export interface RadarData {
   live_size: number; // live-token row count
   live: LiveRow[]; // live-token protocols, by market cap
   rows: RadarRow[]; // ranked rows, compact form
-  comparison: ModelComparison; // radar-2 versus radar-9, computed by the build
+  comparison: ModelComparison; // radar-2 versus radar-10, computed by the build
+  challenger: ChallengerValidation; // the Radar-3 challenger's full validation, same terms as the champion
+  model_contest: ModelContest; // Flat, Radar-3 and Radar-9 on the same snapshot and the same gate
   propensity: PropensityModel; // the fitted tokenization-propensity score, so the page recomputes every row's score
   age_ablation: AgeAblation; // the three feature specs side by side and whether log age survived
   holdout: HoldoutSummary; // what the out-of-sample holdout tests say about the value model
@@ -1768,6 +1847,7 @@ export function buildBoard(
   propensity: PropensityModel,
   holdout: HoldoutSummary,
   blend: { alpha: number; flatMultiple: number },
+  challenger: { k3: number; anchors: { global: number; byCategory: Map<string, number> }; board: boolean },
 ): BoardRow[] {
   const lookup = bySlug(snapshot.protocols);
   const picked = new Map<string, SnapshotProtocol>();
@@ -1815,32 +1895,40 @@ export function buildBoard(
   }
   const ctx: ModelContext = { anchorByCategory: anchors.byCategory, globalAnchor: anchors.global, categoryMedian, blendAlpha: blend.alpha, flatMultiple: blend.flatMultiple };
 
-  // Radar-9 scores each row as three separate numbers: the launch value is the primary USD
+  // Radar-10 scores each row as three separate numbers: the launch value is the primary USD
   // value and the board's ranking; the tokenization propensity is an auxiliary indicator,
   // never multiplied into a USD value; the propensity-weighted priority is launch value times
-  // propensity, a unitless sort aid. The launch value blends the radar formula with the
-  // flat TVL multiple at the rolling-chosen alpha — alpha 0 is the flat fallback. The
-  // range is the holdout error distribution around the launch value, assuming a launch.
-  // The farm verdict is judged on each plan size independently, from the conditional nets
-  // under the drop-share scenarios.
+  // propensity, a unitless sort aid. The launch value is the flat TVL multiple at the
+  // rolling-chosen alpha — alpha 0 is the flat fallback — unless the Radar-3 challenger
+  // passes its two-stage gate, in which case the board runs the challenger's calibrated
+  // value instead and the gate decision says so. The radar-9 formula and the challenger
+  // stay on every row as auxiliaries either way, so the reader sees all three models.
+  // The range is the holdout error distribution around the launch value, assuming a
+  // launch. The farm verdict is judged on each plan size independently, from the
+  // conditional nets under the drop-share scenarios; the robust verdict labels the same
+  // verdict under the gas +50% stress test, separately.
   const scored = pickedRows.map((entry) => {
     const result = impliedValue(entry, snapshot.as_of, model, ctx);
     const propensityValue = propensityScore(entry, snapshot.as_of, propensity);
-    const valueIfLaunches = result.launchValue;
+    const ch = challengerRowFactors(entry, challenger.anchors, categoryMedian.get(entry.category ?? 'Other') ?? null, challenger.k3);
+    const valueIfLaunches = challenger.board ? ch.value : result.launchValue;
     const implied = valueIfLaunches;
     const priority = valueIfLaunches * propensityValue;
-    return { entry, ...result, propensityValue, valueIfLaunches, implied, priority };
+    return { entry, ...result, ch, propensityValue, valueIfLaunches, implied, priority };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.entry.slug < b.entry.slug ? -1 : a.entry.slug > b.entry.slug ? 1 : 0));
-  // Flat and radar ranks: where the row stands by the flat TVL value alone and by the
-  // radar formula alone, so the reader sees where the two models disagree. Ties break
-  // on slug, the same order the board uses.
+  // Flat, radar and challenger ranks: where the row stands by the flat TVL value alone,
+  // by the radar formula alone and by the challenger value alone, so the reader sees
+  // where the three models disagree. Ties break on slug, the same order the board uses.
   const flatRankBySlug = new Map<string, number>();
   [...scored].sort((a, b) => blend.flatMultiple * b.entry.tvl_usd - blend.flatMultiple * a.entry.tvl_usd || (a.entry.slug < b.entry.slug ? -1 : a.entry.slug > b.entry.slug ? 1 : 0))
     .forEach((item, i) => flatRankBySlug.set(item.entry.slug, i + 1));
   const radarRankBySlug = new Map<string, number>();
   [...scored].sort((a, b) => (b.tvlBase * b.growthFactor * b.chainFactor) - (a.tvlBase * a.growthFactor * a.chainFactor) || (a.entry.slug < b.entry.slug ? -1 : a.entry.slug > b.entry.slug ? 1 : 0))
     .forEach((item, i) => radarRankBySlug.set(item.entry.slug, i + 1));
+  const radar3RankBySlug = new Map<string, number>();
+  [...scored].sort((a, b) => b.ch.value - a.ch.value || (a.entry.slug < b.entry.slug ? -1 : a.entry.slug > b.entry.slug ? 1 : 0))
+    .forEach((item, i) => radar3RankBySlug.set(item.entry.slug, i + 1));
   return scored.map((item, i) => {
     const netSmallConservative = farmNet(item.entry, item.valueIfLaunches, item.age, FARM.plan_small, FARM.drop_share_conservative);
     const netSmall = farmNet(item.entry, item.valueIfLaunches, item.age, FARM.plan_small, FARM.drop_share_neutral);
@@ -1861,6 +1949,8 @@ export function buildBoard(
     const netPlanGas100 = farmNetAtGas(item.entry, item.valueIfLaunches, item.age, planSize, FARM.drop_share_neutral, 2);
     const verdictGas50 = farmVerdictAtGas(item.entry, item.valueIfLaunches, item.age, 1.5);
     const verdictGas100 = farmVerdictAtGas(item.entry, item.valueIfLaunches, item.age, 2);
+    const robust = robustFarmVerdictFor(verdict, verdictGas50);
+    const radar3Rank = radar3RankBySlug.get(item.entry.slug)!;
     return {
       rank: i + 1, slug: item.entry.slug, name: item.entry.name,
       category: item.entry.category, chains: item.entry.chains, tvl_usd: item.entry.tvl_usd,
@@ -1884,10 +1974,15 @@ export function buildBoard(
       verdict_gas50: verdictGas50,
       verdict_gas100: verdictGas100,
       flat_rank: flatRank, radar_rank: radarRank, rank_diff: flatRank - radarRank,
+      radar3_value_usd: item.ch.value, radar3_rank: radar3Rank, radar3_tvl_median: item.ch.anchor, robust_farm_verdict: robust,
       net_1000_usd: netSmall, net_10000_usd: netLarge,
       net_1000_conservative_usd: netSmallConservative, net_1000_optimistic_usd: netSmallOptimistic,
       off_list: offList.has(item.entry.slug),
-      model: {
+      model: challenger.board ? {
+        tvl_base: round2(item.ch.tvlBase), growth_factor: round4(item.ch.growthFactor),
+        category_median_7d: item.ch.categoryMedian, chain_factor: round4(item.ch.chainFactor),
+        tvl_median: item.ch.anchor,
+      } : {
         tvl_base: round2(item.tvlBase), growth_factor: round4(item.growthFactor),
         category_median_7d: item.categoryMedian, chain_factor: round4(item.chainFactor),
         tvl_median: item.anchor,
@@ -2181,6 +2276,8 @@ export function radarRow(
     verdict_gas50: boardRow.verdict_gas50,
     verdict_gas100: boardRow.verdict_gas100,
     flat_rank: boardRow.flat_rank, radar_rank: boardRow.radar_rank, rank_diff: boardRow.rank_diff,
+    radar3_value_usd: boardRow.radar3_value_usd, radar3_rank: boardRow.radar3_rank,
+    radar3_tvl_median: boardRow.radar3_tvl_median, robust_farm_verdict: boardRow.robust_farm_verdict,
     net_1000_usd: boardRow.net_1000_usd, net_10000_usd: boardRow.net_10000_usd,
     net_1000_conservative_usd: boardRow.net_1000_conservative_usd,
     net_1000_optimistic_usd: boardRow.net_1000_optimistic_usd,
@@ -2332,12 +2429,26 @@ export function buildRadar(
   // Strict rolling validation picks the blend weight on the first three blocks among the
   // alphas that pass the gate; when none passes the board falls back to flat TVL.
   const rolling = rollingValidation(snapshot);
-  const holdout = holdoutValidation(snapshot, calibrated, rolling.chosen_alpha);
+  // The Radar-3 challenger, validated on the same terms: its own nested calibration, its
+  // own two-stage rolling gate, its own held-out ranges. The gate decides the board: the
+  // challenger takes it only when its gate passes; a blend takes it only when a blend
+  // passes; otherwise flat stays champion. When both a blend and the challenger pass, the
+  // challenger wins — it is the model this release is testing, and its pooled miss is the
+  // tiebreak the contest table shows. The holdout the dashboard prints is the one for the
+  // model the board actually runs, so the ranges describe the board, not a model it does
+  // not run.
+  const challenger = validateChallenger(snapshot);
+  const boardModel: 'flat' | 'blend' | 'challenger' = challenger.rolling.passed
+    ? 'challenger'
+    : rolling.chosen_alpha > 0 ? 'blend' : 'flat';
+  const holdout: HoldoutSummary = boardModel === 'challenger'
+    ? challenger.holdout
+    : holdoutValidation(snapshot, calibrated, rolling.chosen_alpha);
   const accounting = accountingOf(snapshot);
   const tradedAll = snapshot.protocols
     .filter((entry) => entry.mcap_usd !== null && entry.mcap_usd > 0 && entry.tvl_usd > 0);
   const flatMultiple = holdoutMedians(tradedAll).flatMultiple;
-  const ranked = buildBoard(snapshot, calibrated, propensity, holdout, { alpha: rolling.chosen_alpha, flatMultiple });
+  const ranked = buildBoard(snapshot, calibrated, propensity, holdout, { alpha: rolling.chosen_alpha, flatMultiple }, { k3: challenger.scale_k3, anchors: challenger.anchors, board: boardModel === 'challenger' });
   const liveSet = liveRows(snapshot);
   const early = ranked.filter((r) => snapshot.watchlist.includes(r.slug) === false).length;
   // The radar-2 comparison: score the same rows with the old function and rank them the same
@@ -2352,6 +2463,56 @@ export function buildRadar(
   const v2RankBySlug = new Map<string, number>();
   v2Order.forEach((row, i) => v2RankBySlug.set(row.slug, i + 1));
   const comparison = buildComparison(ranked, v2RankBySlug, calibrated.base_multiple);
+  // The champion/challenger contest: Flat, Radar-3 and Radar-9 on the same snapshot, the
+  // same ranked rows, the same splits and the same gate. The Radar-9 row prices the
+  // alpha=1 radar formula at its own nested calibration, so its numbers are the formula's,
+  // not the board's. The historical dev numbers are reference only — v3 and v8 were
+  // scored in different batches, against different opponents — and v11's own dev score
+  // stays blank until the platform scores it after submission.
+  const holdoutRadar9 = holdoutValidation(snapshot, calibrated, 1);
+  const radar9Better123 = rolling.blocks.slice(0, 3)
+    .filter((b) => b.alpha_median_miss[4] < b.flat_median_miss).length;
+  const radar9Veto = rolling.blocks[3]!.alpha_median_miss[4] <= 1.1 * rolling.blocks[3]!.flat_median_miss;
+  const flatRankBySlug = new Map<string, number>();
+  const radar3RankBySlug = new Map<string, number>();
+  const radarRankBySlug = new Map<string, number>();
+  for (const row of ranked) {
+    flatRankBySlug.set(row.slug, row.flat_rank);
+    radar3RankBySlug.set(row.slug, row.radar3_rank);
+    radarRankBySlug.set(row.slug, row.radar_rank);
+  }
+  const modelContest: ModelContest = {
+    rows: [
+      {
+        model: 'Flat', rolling_pooled_miss: rolling.flat_pooled_miss,
+        rolling_better_123: null, rolling_veto: true,
+        loo_median_miss: holdout.loo_flat_median_miss,
+        bytime_median_miss: holdout.bytime_flat_median_miss,
+        historical_dev: '0.825432 · 10W/1D/1L (v8, different batch)', v11_dev: null,
+      },
+      {
+        model: 'Radar-3', rolling_pooled_miss: challenger.rolling.pooled_miss_123,
+        rolling_better_123: challenger.rolling.better_123,
+        rolling_veto: challenger.rolling.veto,
+        loo_median_miss: challenger.holdout.loo_median_miss,
+        bytime_median_miss: challenger.holdout.bytime_median_miss,
+        historical_dev: '0.881 · 12W/0D/0L (v3, different batch)', v11_dev: null,
+      },
+      {
+        model: 'Radar-9', rolling_pooled_miss: rolling.pooled_miss_by_alpha[4],
+        rolling_better_123: radar9Better123, rolling_veto: radar9Veto,
+        loo_median_miss: holdoutRadar9.loo_median_miss,
+        bytime_median_miss: holdoutRadar9.bytime_median_miss,
+        historical_dev: null, v11_dev: null,
+      },
+    ],
+    spearman_flat_radar3: spearman(flatRankBySlug, radar3RankBySlug),
+    spearman_flat_radar9: spearman(flatRankBySlug, radarRankBySlug),
+    spearman_radar3_radar9: spearman(radar3RankBySlug, radarRankBySlug),
+    board_model: boardModel,
+    challenger_passed: challenger.rolling.passed,
+    note: 'Historical dev scores are reference only: v3 and v8 were scored in different batches, against different opponents, so they are not a head-to-head experiment. v11\'s own dev score is blank until the platform scores it after submission.',
+  };
   // Category standings, built from the board's own rows: TVL rank inside the category, plus the
   // category's median seven-day growth across the rows that report one. Deterministic: ties break
   // on slug, the same order the board uses.
@@ -2393,6 +2554,8 @@ export function buildRadar(
     }),
     live: liveSet,
     comparison,
+    challenger,
+    model_contest: modelContest,
     propensity, age_ablation: ablation, holdout,
     blend_alpha: rolling.chosen_alpha, flat_multiple: flatMultiple, rolling,
     accounting, verdict_counts: verdictCounts,
@@ -2455,6 +2618,8 @@ export function boardIssue(
   const ranks = board.map((row) => row.rank).sort((a, b) => a - b);
   for (let i = 0; i < ranks.length; i++) if (ranks[i] !== i + 1) return 'rank ' + (i + 1) + ' is ' + ranks[i];
   for (let i = 1; i < board.length; i++) if (board[i]!.implied_value_usd > board[i - 1]!.implied_value_usd) return 'row ' + (i + 1) + ' outranks row ' + i + ' on implied value';
+  const radar3Ranks = board.map((row) => row.radar3_rank).sort((a, b) => a - b);
+  for (let i = 0; i < radar3Ranks.length; i++) if (radar3Ranks[i] !== i + 1) return 'challenger rank ' + (i + 1) + ' is ' + radar3Ranks[i];
   const endsMatch = board.length >= 2 && board[0]!.implied_value_usd === board[board.length - 1]!.implied_value_usd;
   if (endsMatch) {
     return 'all ' + board.length + ' rows share the same implied value $' + board[0]!.implied_value_usd + ': a board that ranks nothing by value is not a ranking';
@@ -2478,6 +2643,10 @@ export function boardIssue(
     if (Math.abs(row.net_plan_gas100_usd - Math.round((planNet - row.gas_total_usd) * 100) / 100) > 0.02) return row.slug + ' has gas+100% net ' + row.net_plan_gas100_usd + ' but the plan net less the gas is ' + Math.round((planNet - row.gas_total_usd) * 100) / 100;
     if (row.flat_rank < 1 || row.flat_rank > board.length || row.radar_rank < 1 || row.radar_rank > board.length) return row.slug + ' has a rank outside 1..' + board.length;
     if (row.rank_diff !== row.flat_rank - row.radar_rank) return row.slug + ' has rank diff ' + row.rank_diff + ' but flat ' + row.flat_rank + ' minus radar ' + row.radar_rank + ' is ' + (row.flat_rank - row.radar_rank);
+    if (Number.isSafeInteger(row.radar3_value_usd) === false || row.radar3_value_usd <= 0) return row.slug + ' has challenger value ' + row.radar3_value_usd;
+    if (row.radar3_rank < 1 || row.radar3_rank > board.length) return row.slug + ' has a challenger rank outside 1..' + board.length;
+    if (row.radar3_tvl_median <= 0 || Number.isFinite(row.radar3_tvl_median) === false) return row.slug + ' has a challenger anchor ' + row.radar3_tvl_median;
+    if (robustFarmVerdictFor(row.farm_verdict, row.verdict_gas50) !== row.robust_farm_verdict) return row.slug + ' has robust verdict ' + row.robust_farm_verdict + ' but base ' + row.farm_verdict + ' with gas+50% ' + row.verdict_gas50 + ' implies ' + robustFarmVerdictFor(row.farm_verdict, row.verdict_gas50);
     if (row.propensity <= 0 || row.propensity > 1) return row.slug + ' has propensity ' + row.propensity;
     if (row.range_lo_usd > row.implied_value_usd || row.implied_value_usd > row.range_hi_usd) return row.slug + ' has an implied value outside its printed range';
   }

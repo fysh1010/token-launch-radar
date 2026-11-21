@@ -1,10 +1,11 @@
-// Token Radar's dashboard, model radar-6. It reads window.RADAR (written beside dashboard/ by
+// Token Radar's dashboard, model radar-7. It reads window.RADAR (written beside dashboard/ by
 // main.ts) and renders the ranked board, a filterable table, and a per-protocol detail drawer
 // with the model inputs and farm plan. No network: every byte shown is in data.js. launchValueOf
-// recomputes a row's launch value (the primary USD value and the ranking), priorityOf the
-// unitless risk-adjusted score (launch value times propensity, never dollars), propensityOf the
-// fitted score under its feature spec, v2ImpliedOf the previous release's value. The drawer
-// shows the farm plan board.json carries for the row.
+// recomputes a row's launch value (the primary USD value and the ranking) — the flat TVL multiple
+// when the rolling validation falls back to flat, otherwise the log-space blend with the radar
+// formula — priorityOf the unitless risk-adjusted score (launch value times propensity, never
+// dollars), propensityOf the fitted score under its feature spec, v2ImpliedOf the previous
+// release's value. The drawer shows the farm plan board.json carries for the row.
 (function () {
   'use strict';
 
@@ -82,7 +83,7 @@
     var rate = total > 0 ? (launched + 1) / (total + 2) : 0.5;
     var age = row.age_days === null || row.age_days === undefined ? 365 : row.age_days;
     var f = [];
-    (o.features || ['tvl', 'age', 'chains', 'catRate']).forEach(function (name) {
+    (o.features || ['tvl', 'chains', 'catRate']).forEach(function (name) {
       if (name === 'tvl') f.push(Math.log10(Math.max(row.tvl_usd, 1)));
       else if (name === 'age') f.push(Math.log10(age + 30));
       else if (name === 'chains') f.push(Math.min((row.chains || []).length, 6));
@@ -93,8 +94,20 @@
     var clipped = Math.max(-30, Math.min(30, z));
     return 1 / (1 + Math.exp(-clipped));
   }
-  function valueIfLaunchesOf(row) {
+  // The flat TVL value and the radar value, blended in log space at the rolling-chosen alpha:
+  // alpha 1 is the radar formula alone, alpha 0 the flat multiple alone (the fallback when no
+  // blend passes the rolling gate). Mirrors blendedValue in lib/model.ts.
+  function flatValueOf(row) { return DATA.flat_multiple * row.tvl_usd; }
+  function radarValueOf(row) {
     return Math.max(1, Math.round(tvlBaseOf(row) * growthFactorOf(row) * chainFactorOf(row)));
+  }
+  function valueIfLaunchesOf(row) {
+    var alpha = DATA.blend_alpha === undefined || DATA.blend_alpha === null ? 1 : DATA.blend_alpha;
+    var radar = tvlBaseOf(row) * growthFactorOf(row) * chainFactorOf(row);
+    var flat = flatValueOf(row);
+    if (alpha >= 1) return Math.max(1, Math.round(radar));
+    if (alpha <= 0) return Math.max(1, Math.round(flat));
+    return Math.max(1, Math.round(Math.exp(alpha * Math.log(Math.max(1, radar)) + (1 - alpha) * Math.log(Math.max(1, flat)))));
   }
   // The risk-adjusted score: launch value times propensity, a unitless sort aid — never
   // dollars, never an expected value.
@@ -151,6 +164,20 @@
     if (age < 180) return 60;
     if (age < 365) return 45;
     return 30;
+  }
+  // Gas by hold period, mirroring gasForPlan in lib/model.ts: 3 fixed transactions (approve,
+  // deposit, withdraw) plus one weekly action, priced per transaction on its chain — $11.50 on
+  // Ethereum, $3.00 elsewhere. Setup and exit touch every chain in the plan; the weekly action
+  // runs on the main chain.
+  function gasPerTx(chain) { return chain === 'Ethereum' ? 11.5 : 3; }
+  function gasTransactionsFor(holdDays) { return 3 + Math.floor(holdDays / 7); }
+  function gasForPlan(chains, holdDays) {
+    var ntx = gasTransactionsFor(holdDays);
+    var weekly = Math.max(0, ntx - 3);
+    var list = chains || [];
+    var setup = 0, exit = 0;
+    list.forEach(function (c) { setup += gasPerTx(c); exit += gasPerTx(c); });
+    return Math.round((setup + exit + weekly * gasPerTx(list[0] || 'other')) * 100) / 100;
   }
   function fmtTvl(n) {
     if (n >= 1e9) return '$' + (n / 1e9).toFixed(2) + 'B';
@@ -312,31 +339,42 @@
   }
 
   function overview() {
+    var over100 = DATA.rows.filter(function (r) { return r.implied_value_usd >= 100e6; }).length;
     return el('section', { class: 'panel overview', 'aria-label': 'Where the value sits' },
       el('div', { class: 'overview-head' },
         el('h2', { text: 'Where the value sits' }),
-        el('p', { class: 'sub', text: 'Six protocols clear $100M; most rows are small, young and unpriced.' })
+        el('p', { class: 'sub', text: over100 + ' protocols clear $100M; most rows are small, young and unpriced.' })
       ),
       distributionChart(),
       categoryStrip()
     );
   }
 
-  // Radar-2 versus radar-6: the build computes the correlation and movers; the page renders them.
+  // Radar-2 versus radar-7: the build computes the correlation and movers; the page renders them.
+  // The rolling sentence reads the validation in data.js, so it says flat when the board uses
+  // flat and names the blend when a blend passes the gate.
+  function rollingSentence() {
+    var r = DATA.rolling;
+    if (!r) return 'Radar-7 measures growth against the protocol\'s own category, drops the age discount, and keeps propensity out of the dollar value.';
+    var best = Math.min.apply(null, r.pooled_miss_all_by_alpha);
+    var pct = Math.round((1 - best / r.flat_pooled_miss_all) * 100);
+    if (r.board_uses_flat) return 'Radar-7 ranks by the flat TVL multiple: the strict rolling validation found no blend of the radar formula that beats flat TVL out of time — the best blend is only ' + pct + '% below flat across the four blocks, short of the 10% gate, and worse than flat on the held-out block — so the board uses flat and the radar formula stays as an auxiliary valuation per row. Growth is measured against the protocol\'s own category, the age discount is dropped, and propensity stays out of the dollar value.';
+    return 'Radar-7 blends the radar formula with the flat TVL multiple at alpha ' + r.chosen_alpha + ' in log space, chosen by the strict rolling validation — the best blend is ' + pct + '% below flat across the four blocks. Growth is measured against the protocol\'s own category, the age discount is dropped, and propensity stays out of the dollar value.';
+  }
   function comparisonPanel() {
     var comp = DATA.comparison;
     if (!comp) return null;
     var mover = function (m) {
       return el('div', { class: 'mover' },
         el('b', { text: m.name }),
-        el('span', { class: 'num', text: 'radar-2 #' + m.v2_rank + '  →  radar-6 #' + m.current_rank }),
+        el('span', { class: 'num', text: 'radar-2 #' + m.v2_rank + '  →  radar-7 #' + m.current_rank }),
         el('span', { class: 'sub', text: m.reason })
       );
     };
-    return el('section', { class: 'panel compare', 'aria-label': 'Radar-2 vs radar-6' },
+    return el('section', { class: 'panel compare', 'aria-label': 'Radar-2 vs radar-7' },
       el('div', { class: 'overview-head' },
-        el('h2', { text: 'Radar-2 vs radar-6: what changed' }),
-        el('p', { class: 'sub', text: 'Spearman ' + comp.spearman.toFixed(2) + ' — the models mostly agree. Radar-6 scores TVL sub-linearly, measures growth against the protocol\'s own category, drops the age discount, and keeps propensity out of the dollar value.' })
+        el('h2', { text: 'Radar-2 vs radar-7: what changed' }),
+        el('p', { class: 'sub', text: 'Spearman ' + comp.spearman.toFixed(2) + ' — the models mostly agree. ' + rollingSentence() })
       ),
       el('div', { class: 'movers' },
         el('div', null,
@@ -375,12 +413,66 @@
       ),
       el('p', { class: 'sub', text: 'Age ablation: log age lifts random-fold AUC (' + ab.b_with_age.oof_auc.toFixed(2) + ' vs ' + ab.a_no_age.oof_auc.toFixed(2) + ') but cuts time-split AUC (' + ab.b_with_age.ts_auc.toFixed(2) + ' vs ' + ab.a_no_age.ts_auc.toFixed(2) + ') and degrades both newer halves — age is ' + (ab.kept_age ? 'kept' : 'dropped') + '. listed_at is DefiLlama\'s listing date, not the operating start.' }),
       el('p', { class: 'sub', text: 'Out-of-fold: ROC-AUC ' + o.roc_auc.toFixed(2) + ' · Brier ' + o.brier.toFixed(2) + ' (' + o.brier_baseline.toFixed(2) + ' always guessing the ' + Math.round(o.base_rate * 100) + '% base rate) · log loss ' + o.log_loss.toFixed(2) + ' (' + o.log_loss_baseline.toFixed(2) + '). Calibration, predicted → actual share with a token: ' + cal + '.' }),
-      el('p', { class: 'sub', text: 'By time — fitted on protocols listed before ' + ts.split + ', scored on the ' + ts.n + ' after it — AUC ' + ts.roc_auc.toFixed(2) + ', Brier ' + ts.brier.toFixed(2) + ', log loss ' + ts.log_loss.toFixed(2) + ': dropping age lifts AUC from ' + ab.b_with_age.ts_auc.toFixed(2) + ' to ' + ab.a_no_age.ts_auc.toFixed(2) + ', but the Brier stays poor on newer protocols.' }),
+      el('p', { class: 'sub', text: 'By time — fitted on protocols listed before ' + ts.split + ', scored on the ' + ts.n + ' after it — AUC ' + ts.roc_auc.toFixed(2) + ', Brier ' + ts.brier.toFixed(2) + ' (' + ts.brier_baseline.toFixed(2) + ' always guessing the training base rate), log loss ' + ts.log_loss.toFixed(2) + ' (' + ts.log_loss_baseline.toFixed(2) + ').' + (ts.brier > ts.brier_baseline || ts.log_loss > ts.log_loss_baseline ? ' Below baseline on the time split — the propensity has no reliable cross-period predictive power.' : '') + ' Dropping age lifts AUC from ' + ab.b_with_age.ts_auc.toFixed(2) + ' to ' + ab.a_no_age.ts_auc.toFixed(2) + ', but the Brier stays poor on newer protocols.' }),
       el('p', { class: 'sub', text: 'Checked on the ' + h.loo_n + ' traded tokens, with nested calibration — each test sample\'s scale comes from the others, never its own cap. Leave-one-out: median miss x' + h.loo_median_miss.toFixed(2) + ', against x' + h.loo_flat_median_miss.toFixed(2) + ' for a flat TVL multiple; ' + Math.round(h.loo_within_2x * 100) + '% of caps land within 2x. By time — older half fits, newer half priced, split ' + h.bytime_split + ', ' + h.bytime_n + ' tokens — median miss x' + h.bytime_median_miss.toFixed(2) + ' against x' + h.bytime_flat_median_miss.toFixed(2) + '. The scale drifts: the old half\'s median log error is ' + h.bytime_train_log_median.toFixed(2) + ', the new half\'s ' + h.bytime_test_log_median.toFixed(2) + '. The value base is 0.25 x ' + DATA.scale_k.toFixed(2) + ', the scale the traded tokens imply.' }),
-      el('p', { class: 'sub', text: 'Uncertainty has two layers. (1) The printed range is the value IF it launches, from the leave-one-out error distribution (x' + h.range_lo_factor.toFixed(2) + ' to x' + h.range_hi_factor.toFixed(2) + ' for P25–P75; P10–P90 x' + h.range_lo10_factor.toFixed(2) + ' to x' + h.range_hi90_factor.toFixed(2) + '). (2) The propensity band is the launch uncertainty — P10–P90 is not an 80% confidence interval on the airdrop value. On the by-time held-out caps, ' + Math.round(h.coverage_2575 * 100) + '% fall inside the printed range, ' + Math.round(h.coverage_1090 * 100) + '% inside P10–P90 — below the nominal 50% because the scale drifts.' }),
+      el('p', { class: 'sub', text: 'Uncertainty has two layers. (1) The printed range is the value IF it launches, from the leave-one-out error distribution (x' + h.range_lo_factor.toFixed(2) + ' to x' + h.range_hi_factor.toFixed(2) + ' for the Central 60% model range, P20–P80; P10–P90 x' + h.range_lo10_factor.toFixed(2) + ' to x' + h.range_hi90_factor.toFixed(2) + '). (2) The propensity band is the launch uncertainty — P10–P90 is not an 80% confidence interval on the airdrop value. On the by-time held-out caps, ' + Math.round(h.coverage_central60 * 100) + '% fall inside the printed range, ' + Math.round(h.coverage_1090 * 100) + '% inside P10–P90 — the nominal targets are 60% and 80%.' }),
       el('p', { class: 'sub', text: '758 protocols, accounted for: ' + accounting + '.' }),
-      el('p', { class: 'sub', text: 'Farm verdicts, judged on each plan size: Farm needs the 1% net above $10 on the $1,000 plan; Marginal the 3% net above $0 — on the $1,000 plan, or on the $10,000 plan when the small plan does not clear it; Skip neither. ' + vc.farm + ' Farm · ' + vc.marginal + ' Marginal · ' + vc.skip + ' Skip. All ' + vc.marginal + ' Marginal earn it on the $10,000 plan; no $1,000 plan clears $0 at 3% once 7 transactions of gas are counted. Rewards are conditional — assuming launch and a pro-rata drop allocation — not expected returns.' }),
+      el('p', { class: 'sub', text: 'Farm verdicts, judged on each plan size: Farm needs the 1% net above $10 on the $1,000 plan; Marginal the 3% net above $0 — on the $1,000 plan, or on the $10,000 plan when the small plan does not clear it; Skip neither. ' + vc.farm + ' Farm · ' + vc.marginal + ' Marginal · ' + vc.skip + ' Skip. Gas is counted per transaction on its chain — 7 for a 30-day hold, 9 for 45, 11 for 60 — so a longer hold costs more. Rewards are conditional — assuming launch and a pro-rata drop allocation — not expected returns.' }),
       el('p', { class: 'sub', text: 'Two different goals: the board ranks by launch value; the farm verdict is the conditional net of a plan — a top-ranked protocol can still be a Skip on a small plan.' })
+    );
+  }
+
+  // Strict rolling time validation: the 95 dated traded tokens, earliest 47 as the training
+  // set, the rest in four blocks of 12, each block priced only from data before it. The first
+  // three blocks pick the blend weight; the fourth is held out as final validation. The gate
+  // needs a pooled miss at least 10% below flat, at least 3 of 4 blocks better than flat, and
+  // the held-out block not clearly worse; when no blend passes, the board uses flat TVL.
+  function rollingPanel() {
+    var r = DATA.rolling;
+    if (!r) return null;
+    var best = Math.min.apply(null, r.pooled_miss_all_by_alpha);
+    var pct = Math.round((1 - best / r.flat_pooled_miss_all) * 100);
+    var last = r.blocks[r.blocks.length - 1];
+    var lastWorseAll = last.alpha_median_miss.slice(1).every(function (m) { return m > last.flat_median_miss; });
+    var gateText = r.board_uses_flat
+      ? 'No blend passes the gate: the best blend is only ' + pct + '% below flat across all four blocks, and the held-out fourth block is worse than flat for every blend — so the board ranks by the flat TVL multiple and the radar formula stays as an auxiliary valuation.'
+      : 'Blend alpha ' + r.chosen_alpha + ' passes the gate: ' + pct + '% below flat across all four blocks, better than flat on at least three blocks, and the held-out fourth block is not clearly worse — so the board ranks by the blended value.';
+    if (r.board_uses_flat && !lastWorseAll) gateText = 'No blend passes the gate: the best blend is only ' + pct + '% below flat across all four blocks, short of the 10% the gate needs — so the board ranks by the flat TVL multiple and the radar formula stays as an auxiliary valuation.';
+    var head = el('tr', null,
+      el('th', { scope: 'col', text: 'Block' }),
+      el('th', { scope: 'col', text: 'Listed' }),
+      el('th', { scope: 'col', text: 'Train' }),
+      el('th', { scope: 'col', text: 'Flat (α=0)' }),
+      el('th', { scope: 'col', text: 'α=0.25' }),
+      el('th', { scope: 'col', text: 'α=0.50' }),
+      el('th', { scope: 'col', text: 'α=0.75' }),
+      el('th', { scope: 'col', text: 'α=1.00' }),
+      el('th', { scope: 'col', text: 'Central 60%' }),
+      el('th', { scope: 'col', text: 'P10–P90' })
+    );
+    var tbody = el('tbody');
+    r.blocks.forEach(function (b) {
+      tbody.appendChild(el('tr', null,
+        el('td', { class: 'num', text: String(b.block) }),
+        el('td', { text: b.start + ' – ' + b.end }),
+        el('td', { class: 'num', text: String(b.train_n) }),
+        el('td', { class: 'num', text: 'x' + b.alpha_median_miss[0].toFixed(2) }),
+        el('td', { class: 'num', text: 'x' + b.alpha_median_miss[1].toFixed(2) }),
+        el('td', { class: 'num', text: 'x' + b.alpha_median_miss[2].toFixed(2) }),
+        el('td', { class: 'num', text: 'x' + b.alpha_median_miss[3].toFixed(2) }),
+        el('td', { class: 'num', text: 'x' + b.alpha_median_miss[4].toFixed(2) }),
+        el('td', { class: 'num', text: Math.round(b.central60_coverage * 100) + '%' }),
+        el('td', { class: 'num', text: Math.round(b.p1090_coverage * 100) + '%' })
+      ));
+    });
+    return el('section', { class: 'panel odds', 'aria-label': 'Rolling time validation' },
+      el('div', { class: 'overview-head' },
+        el('h2', { text: 'Rolling time validation: does the model beat flat TVL out of time?' }),
+        el('p', { class: 'sub', text: 'The ' + r.dated_n + ' traded tokens with a listing date, earliest ' + r.initial_n + ' as the training set, the rest in four blocks of ' + r.block_n + '. Each block is priced only from data before it — no future sample enters that block\'s anchor, category median, scale or blend choice. The first three blocks pick the blend; the fourth is held out as final validation. Median miss is the median |log(actual / predicted)|, as a multiple.' })
+      ),
+      el('div', { class: 'table-wrap' }, el('table', null, el('thead', null, head), tbody)),
+      el('p', { class: 'sub', text: gateText }),
+      el('p', { class: 'sub', text: 'Coverage targets: Central 60% 50%–65% per block, P10–P90 75%–85%. The newest block is the hardest: even the flat multiple misses by x' + r.blocks[3].flat_median_miss.toFixed(2) + ' there, against x' + r.blocks[0].flat_median_miss.toFixed(2) + ', x' + r.blocks[1].flat_median_miss.toFixed(2) + ' and x' + r.blocks[2].flat_median_miss.toFixed(2) + ' in the earlier blocks.' })
     );
   }
 
@@ -505,13 +597,20 @@
 
   function modelPanel() {
     var m = DATA.model;
+    var r = DATA.rolling;
+    var flat = r && r.board_uses_flat;
+    var boardFormula = flat
+      ? 'launch value = round(' + DATA.flat_multiple.toFixed(4) + ' x tvl_usd) — the flat TVL multiple, the median market-cap-to-TVL over the traded tokens. The board ranks by this value.'
+      : 'launch value = round(exp(' + DATA.blend_alpha + ' x ln(radar value) + ' + (1 - DATA.blend_alpha).toFixed(2) + ' x ln(' + DATA.flat_multiple.toFixed(4) + ' x tvl_usd))) — the log-space blend of the radar value and the flat TVL multiple at the rolling-chosen alpha.';
+    var radarFormula = 'radar value = round(' + m.base_multiple.toFixed(4) + ' x tvl_usd^' + m.tvl_exponent + ' x anchor^' + m.median_exponent + ' x (1 + ' + m.growth_weight + ' x tanh((change_7d - category_median_7d) / ' + m.growth_scale + ')) x (1 + ' + m.chain_step + ' x min(chains - 1, ' + m.chain_max_steps + '))); anchor is the traded-token TVL median for the row\'s category, shrunk toward the global median; priority = launch value x propensity (unitless).';
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How launch value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No name is special-cased, no row hand-picked.' }),
-      el('div', { class: 'formula' },
-        'launch value = round(' + m.base_multiple.toFixed(4) + ' x tvl_usd^' + m.tvl_exponent + ' x anchor^' + m.median_exponent + ' x (1 + ' + m.growth_weight + ' x tanh((change_7d - category_median_7d) / ' + m.growth_scale + ')) x (1 + ' + m.chain_step + ' x min(chains - 1, ' + m.chain_max_steps + '))); anchor is the traded-token TVL median for the row\'s category, shrunk toward the global median; priority = launch value x propensity (unitless).'
-      ),
-      el('p', { class: 'sub', text: 'TVL enters sub-linearly, anchored on the traded-token median for the row\'s category (global ' + fmtUsd(DATA.tvl_anchor_global) + ', shrunk by category): a protocol ten times bigger is worth about seven times more, not ten. Growth is measured against the protocol\'s own category median: outgrowing your own kind is the signal, and a short spike saturates instead of paying up to 2.05x. The base multiple is 0.25 x ' + DATA.scale_k.toFixed(2) + ', set by the traded tokens\' median raw log error under nested calibration. A protocol above the floor that the watchlist leaves out is ranked and flagged OFF LIST.' })
+      el('div', { class: 'formula' }, boardFormula),
+      el('div', { class: 'formula' }, (flat ? 'Auxiliary: ' : 'Radar value: ') + radarFormula),
+      el('p', { class: 'sub', text: flat
+        ? 'The board uses the flat multiple because the strict rolling validation found no blend that beats it out of time (see the rolling table): the radar formula is kept as an auxiliary valuation per row. In the radar formula, TVL enters sub-linearly, anchored on the traded-token median for the row\'s category (global ' + fmtUsd(DATA.tvl_anchor_global) + ', shrunk by category): a protocol ten times bigger is worth about seven times more, not ten. Growth is measured against the protocol\'s own category median: outgrowing your own kind is the signal, and a short spike saturates instead of paying up to 2.05x. The base multiple is 0.25 x ' + DATA.scale_k.toFixed(2) + ', set by the traded tokens\' median raw log error under nested calibration. A protocol above the floor that the watchlist leaves out is ranked and flagged OFF LIST.'
+        : 'TVL enters sub-linearly in the radar value, anchored on the traded-token median for the row\'s category (global ' + fmtUsd(DATA.tvl_anchor_global) + ', shrunk by category): a protocol ten times bigger is worth about seven times more, not ten. Growth is measured against the protocol\'s own category median: outgrowing your own kind is the signal, and a short spike saturates instead of paying up to 2.05x. The base multiple is 0.25 x ' + DATA.scale_k.toFixed(2) + ', set by the traded tokens\' median raw log error under nested calibration. A protocol above the floor that the watchlist leaves out is ranked and flagged OFF LIST.' })
     );
   }
 
@@ -531,6 +630,12 @@
     var prioMatch = prio === row.priority_score;
     var v2recomputed = v2ImpliedOf(row);
     var v2match = v2recomputed === row.v2_implied;
+    var hold = holdDaysFor(row.age_days);
+    var ntx = gasTransactionsFor(hold);
+    var boardUsesFlat = DATA.rolling && DATA.rolling.board_uses_flat;
+    var valueText = boardUsesFlat
+      ? 'Launch value is the flat TVL multiple (' + DATA.flat_multiple.toFixed(4) + ' x TVL): the strict rolling validation found no blend of the radar formula that beats flat out of time, so the board ranks by flat and the radar value is an auxiliary estimate. '
+      : 'Launch value blends the radar value with the flat TVL multiple in log space at alpha ' + DATA.blend_alpha + ', chosen by the strict rolling validation. ';
     var standing = row.category_tvl_rank !== null && row.category_tvl_rank !== undefined
       ? 'TVL rank ' + row.category_tvl_rank + ' in ' + (row.category || 'Other') + (row.category_growth_median !== null && row.category_growth_median !== undefined ? ', against a category median 7d growth of ' + fmtPct(row.category_growth_median) : '')
       : null;
@@ -542,7 +647,6 @@
       ),
       el('button', { class: 'close', type: 'button', 'aria-label': 'Close details', text: 'Close', onclick: function () { dialog.close(); } })
     ));
-    var catMed = CTX.catMedian[row.category || 'Other'];
     var netsText = row.farm_plan_size === 10000
       ? 'conditional net at 3% ' + fmtUsd(row.net_10000_usd) + ' (on $1,000 at 1% ' + fmtUsd(row.net_1000_conservative_usd) + ', at 3% ' + fmtUsd(row.net_1000_usd) + ', at 7% ' + fmtUsd(row.net_1000_optimistic_usd) + ')'
       : 'conditional net at 1% ' + fmtUsd(row.net_1000_conservative_usd) + ', at 3% ' + fmtUsd(row.net_1000_usd) + ', at 7% ' + fmtUsd(row.net_1000_optimistic_usd) + ' (' + fmtUsd(row.net_10000_usd) + ' on $10,000 at 3%)';
@@ -552,23 +656,24 @@
         el('div', null, el('span', { text: 'TVL base: ' + DATA.model.base_multiple.toFixed(4) + ' x TVL^0.85 x anchor^0.15' }), el('b', { class: 'num', text: fmtUsd(tvlBaseOf(row)) })),
         el('div', null, el('span', { text: 'Growth factor: 7d vs category median' }), el('b', { class: 'num', text: fmtMult(growthFactorOf(row)) })),
         el('div', null, el('span', { text: 'Chain factor: ' + (row.chains || []).length + ' chains' }), el('b', { class: 'num', text: fmtMult(chainFactorOf(row)) })),
+        el('div', null, el('span', { text: 'Flat TVL value: ' + DATA.flat_multiple.toFixed(4) + ' x TVL' }), el('b', { class: 'num', text: fmtUsd(flatValueOf(row)) })),
+        el('div', null, el('span', { text: 'Auxiliary radar value (TVL base x growth x chain)' }), el('b', { class: 'num', text: fmtUsd(radarValueOf(row)) })),
         el('div', null, el('span', { text: 'Tokenization propensity (' + propensityBand(propensityOf(row)) + ') — indicator only' }), el('b', { class: 'num', text: Math.round(propensityOf(row) * 100) + '%' })),
         el('div', null, el('span', { text: 'Risk-adjusted score (unitless)' }), el('b', { class: 'num', text: fmtNum(prio) })),
         el('div', { class: 'total' }, el('span', { text: 'Launch value (the ranking value)' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
-      el('p', { class: 'sub', text: 'TVL ' + fmtUsd(row.tvl_usd) + ' against the row\'s category anchor of ' + fmtUsd(row.tvl_median) + '; seven-day growth ' + fmtPct(row.change_7d) + ' against a ' + (row.category || 'Other') + ' median of ' + fmtPct(catMed) + '. Age with no token, ' + fmtAge(row.age_days) + ', does not enter the value. The page recomputes this row as ' + fmtUsd(recomputed) + (match ? ', the same number board.json carries' : ', which differs from the board: the data would be stale') + ', and its priority score as ' + fmtNum(prio) + (prioMatch ? ', matching.' : ', differing: the data would be stale.') + ' This is an estimate, not a price.' }),
-      el('p', { class: 'sub', text: 'Two layers. (1) Value if it launches: ' + fmtUsd(row.range_lo_usd) + ' to ' + fmtUsd(row.range_hi_usd) + ' (P25–P75), ' + fmtUsd(row.range_lo10_usd) + ' to ' + fmtUsd(row.range_hi90_usd) + ' (P10–P90), cut from the holdout error distribution. (2) Whether it launches: propensity ' + Math.round(row.propensity * 100) + '% (' + propensityBand(row.propensity) + '), a cross-sectional score, not a calibrated chance. P10–P90 is not an 80% confidence interval on the final airdrop value. Farm verdict ' + row.farm_verdict + ' on a $' + row.farm_plan_size + ' plan: ' + netsText + ', less 7 transactions of gas and the cost of the capital. Conditional on launch and a pro-rata drop — not an expected return.' }),
-      el('p', { class: 'sub', text: 'Under radar-2 this protocol ranked #' + row.v2_rank + ' with an implied value of ' + fmtUsd(row.v2_implied) + ' (recomputed ' + fmtUsd(v2recomputed) + (v2match ? ', matching.' : ', differing: the data would be stale.') + ' Radar-6 ranks it #' + row.rank + '.' }),
+      el('p', { class: 'sub', text: valueText + 'Age with no token, ' + fmtAge(row.age_days) + ', does not enter either value. The page recomputes this row as ' + fmtUsd(recomputed) + (match ? ', the same number board.json carries' : ', which differs from the board: the data would be stale') + ', and its priority score as ' + fmtNum(prio) + (prioMatch ? ', matching.' : ', differing: the data would be stale.') + ' This is an estimate, not a price.' }),
+      el('p', { class: 'sub', text: 'Two layers. (1) Value if it launches: ' + fmtUsd(row.range_lo_usd) + ' to ' + fmtUsd(row.range_hi_usd) + ' (Central 60% model range, P20–P80), ' + fmtUsd(row.range_lo10_usd) + ' to ' + fmtUsd(row.range_hi90_usd) + ' (P10–P90), cut from the holdout error distribution. (2) Whether it launches: propensity ' + Math.round(row.propensity * 100) + '% (' + propensityBand(row.propensity) + '), a cross-sectional score, not a calibrated chance. P10–P90 is not an 80% confidence interval on the final airdrop value. Farm verdict ' + row.farm_verdict + ' on a $' + row.farm_plan_size + ' plan: ' + netsText + ', less ' + ntx + ' transactions of gas and the cost of the capital. Conditional on launch and a pro-rata drop — not an expected return.' }),
+      el('p', { class: 'sub', text: 'Under radar-2 this protocol ranked #' + row.v2_rank + ' with an implied value of ' + fmtUsd(row.v2_implied) + ' (recomputed ' + fmtUsd(v2recomputed) + (v2match ? ', matching.' : ', differing: the data would be stale.') + ' Radar-7 ranks it #' + row.rank + '.' }),
       standing ? el('p', { class: 'sub', text: standing + '.' }) : null
     ));
     var capital = row.farm_plan_size || 1000;
-    var hold = holdDaysFor(row.age_days);
-    var gasTotal = 7 * (chainOf(row) === 'Ethereum' ? 11.5 : 3);
+    var gasTotal = gasForPlan(row.chains, hold);
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Budget and risk' }),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'Capital for one position' }), el('b', { class: 'num', text: '$' + capital })),
-        el('div', null, el('span', { text: 'Gas budget, 7 transactions (estimate)' }), el('b', { class: 'num', text: '$' + gasTotal.toFixed(2) })),
+        el('div', null, el('span', { text: 'Gas budget, ' + ntx + ' transactions (estimate)' }), el('b', { class: 'num', text: '$' + gasTotal.toFixed(2) })),
         el('div', null, el('span', { text: 'Plan state' }), el('b', { class: 'num', text: row.plan_state || 'Conditional' })),
         el('div', null, el('span', { text: 'Hold at least' }), el('b', { class: 'num', text: hold + ' days' })),
         el('div', null, el('span', { text: 'Exit rule' }), el('b', { class: 'num', text: 'unwind if TVL halves from ' + fmtTvl(row.tvl_usd) }))
@@ -605,6 +710,8 @@
       if (compare) shell.appendChild(compare);
       var prop = propensityPanel();
       if (prop) shell.appendChild(prop);
+      var rolling = rollingPanel();
+      if (rolling) shell.appendChild(rolling);
       shell.appendChild(modelPanel());
     }
     shell.appendChild(el('p', { class: 'note', text: 'Source: DefiLlama protocol index, snapshot ' + DATA.as_of + '. "Records no token" means the snapshot carries no market cap, CoinGecko id or symbol — not proof none exists. Launch value is this entry\'s own model, never a price, and no farm plan promises a token or an airdrop.' }));

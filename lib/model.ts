@@ -1,4 +1,4 @@
-// Token Radar's scoring model, release radar-6: a sealed snapshot goes in, a ranked board comes out.
+// Token Radar's scoring model, release radar-7: a sealed snapshot goes in, a ranked board comes out.
 //
 // Which protocols make the board. The board always carries every slug the snapshot's watchlist
 // names — that list is the floor, never the ceiling — and on top of it the early radar adds
@@ -21,19 +21,24 @@
 //
 // The board carries three separate numbers per row, never folded into one another:
 //
-//   launch value        = base x tvl_usd^0.85 x anchor^0.15 x growth x chains
-//                          (the radar-3 value formula: the anchor is the traded-token TVL
-//                          anchor, shrunk by category — see tvlAnchors — growth is
+//   launch value        = flat_multiple x tvl_usd — the flat TVL multiple, the median
+//                          market-cap-to-TVL over the traded tokens. This is the primary
+//                          USD valuation and the board's ranking, because the strict
+//                          rolling validation found no blend of the radar formula that
+//                          beats flat TVL out of time (see below). The radar formula is
+//                          kept as an auxiliary valuation per row:
+//                          radar value = base x tvl_usd^0.85 x anchor^0.15 x growth
+//                          x chains (the anchor is the traded-token TVL anchor, shrunk
+//                          by category — see tvlAnchors — growth is
 //                          1 + 0.25 x tanh((change_7d - cat_median) / 25) against the
 //                          category median, chains is 1 + 0.03 x min(max(chains - 1, 0), 5)).
-//                          This is the primary USD valuation and the board's DEFAULT
-//                          ranking. The base is not the round 0.25 any more: it is
+//                          The base is not the round 0.25 any more: it is
 //                          0.25 x k, where k = exp(median log(MCAP / predicted)) over the
 //                          traded tokens' leave-one-out predictions — the value scale the
 //                          traded tokens themselves imply, not a round number and not a
 //                          competitor's total.
-//   tokenization propensity = sigmoid(w0 + w1 x z(log10 TVL) + w2 x z(log10(age + 30)) + w3 x z(chains)
-//                          + w4 x z(category rate)), a logistic score fitted on the eligible
+//   tokenization propensity = sigmoid(w0 + w1 x z(log10 TVL) + w2 x z(chains)
+//                          + w3 x z(category rate)), a logistic score fitted on the eligible
 //                          protocols only — every protocol the board's own visible test keeps,
 //                          launched or not — with the protocol itself left out of its category
 //                          rate and the features standardised on the training set. It is an
@@ -41,11 +46,11 @@
 //                          that the protocol will launch a token: the label is "has a token
 //                          at snapshot time", the snapshot is a single cross-section, and no
 //                          future launch dates exist to calibrate against. It is never
-//                          multiplied into a USD value. Age scores in the propensity, not in
-//                          the value — and only if the ablation in fitPropensityModel keeps
-//                          it: a protocol that has run three years with no token is not
-//                          worth more, but among the eligible protocols the older ones more
-//                          often have a token already.
+//                          multiplied into a USD value. Log age was tried in the ablation and
+//                          dropped: it lifts random-fold AUC but cuts time-split AUC, so the
+//                          final spec has no age term — see the ablation in
+//                          fitPropensityModel. Age never enters the value either: a protocol
+//                          that has run three years with no token is not worth more.
 //   risk-adjusted score  = launch value x tokenization propensity, a unitless sort aid
 //                          only — never labelled USD, never called an expected value. The
 //                          dashboard offers it as an alternate sort; the board's rank,
@@ -55,16 +60,25 @@
 // The value formula is checked out of sample, not just fitted: leave-one-out over the traded
 // tokens and by-time (the older half fits the model that prices the newer half), each against
 // a flat TVL-multiple baseline, and each with NESTED calibration — a test sample's own market
-// cap never enters its own scale factor, so the reported misses are honest. The printed
-// range on every row is the nested leave-one-out error distribution's P25-P75 (and P10-P90)
-// around the launch value, and the coverage those ranges achieve on the by-time held-out
-// caps is measured and printed alongside. The range is the value model's error assuming a
-// launch; the propensity score is the separate launch uncertainty, and the dashboard shows
-// the two apart — the P10-P90 range is not an 80% confidence interval on the final airdrop
-// value. No protocol name is ever special-cased, and no row is hand-picked: one function
-// scores every row, and the dashboard prints the formula alongside the constants it runs.
-// The previous release's formula is kept beside it as a comparison function only, never
-// for the ranking.
+// cap never enters its own scale factor, so the reported misses are honest. The board's
+// launch value is a log-space blend of the radar formula and the flat TVL multiple,
+// ln V = alpha x ln V_radar + (1 - alpha) x ln V_flat, and alpha is chosen by STRICT
+// ROLLING validation: the dated traded tokens, ordered by listing date, split into an
+// initial training set and four consecutive test blocks, each block priced from prior data
+// only — no future sample enters that block's anchor, category median, flat multiple or
+// scale factor — the first three blocks pick alpha among the alphas that pass the gate
+// (overall median miss at least 10% below flat, at least 3 of 4 blocks better than flat,
+// the held-out last block not clearly worse), and when no alpha passes the gate the board
+// falls back to the flat TVL multiple and says so. The printed range on every row is the
+// Central 60% model range (P20-P80) and the P10-P90 range, cut from the nested
+// leave-one-out error distribution around the launch value, and the coverage those ranges
+// achieve on the by-time held-out caps is measured and printed alongside, per rolling
+// block. The range is the value model's error assuming a launch; the propensity score is
+// the separate launch uncertainty, and the dashboard shows the two apart — the P10-P90
+// range is not an 80% confidence interval on the final airdrop value. No protocol name is
+// ever special-cased, and no row is hand-picked: one function scores every row, and the
+// dashboard prints the formula alongside the constants it runs. The previous release's
+// formula is kept beside it as a comparison function only, never for the ranking.
 
 /** A snapshot protocol entry: the ten fields the sealed input carries, no more. */
 export interface SnapshotProtocol {
@@ -126,7 +140,7 @@ export const MODEL_V2: ModelConstantsV2 = { // radar-2, comparison only
 };
 
 /** The model release label, the one the dashboard shows. */
-export const MODEL_VERSION: string = 'radar-6';
+export const MODEL_VERSION: string = 'radar-7';
 
 /** Live-token rows in the dashboard's Live token view, by market cap. */
 export const LIVE_ROWS: number = 24;
@@ -146,12 +160,13 @@ export interface FarmStep {
  * because a small position is a dust share of its drop. */
 export type FarmVerdict = 'Farm' | 'Marginal' | 'Skip';
 
-/** How executable a protocol's farm plan is, from the snapshot alone: Verified means the
- * snapshot shows a large, long-running protocol in a category with one canonical product —
- * it is not a live check of the specific vault or pool; Conditional means the steps are
- * category-inferred hypotheticals, worded "if it runs..."; Research first means the
- * category names no product to pin an interaction on, so the plan starts with research. */
-export type PlanState = 'Verified' | 'Conditional' | 'Research first';
+/** How executable a protocol's farm plan is, from the snapshot alone: Category-supported
+ * means the snapshot shows a large, long-running protocol in a category with one canonical
+ * product — the name means the category supports a product, not that the specific vault or
+ * pool was checked live; Conditional means the steps are category-inferred hypotheticals,
+ * worded "if it runs..."; Research first means the category names no product to pin an
+ * interaction on, so the plan starts with research. */
+export type PlanState = 'Category-supported' | 'Conditional' | 'Research first';
 
 /** The tokenization-propensity score's constants. */
 export interface PropensityConstants {
@@ -177,13 +192,18 @@ export interface PropensityBand {
 }
 
 /** The time-split check: the older half of the training set fits the model that scores the
- * newer half, so the numbers are out of sample in time as well as in fold. */
+ * newer half, so the numbers are out of sample in time as well as in fold. The baselines
+ * are the same quality numbers for always predicting the training set's base rate on the
+ * newer half: when the model is worse than its baseline, the dashboard says so plainly
+ * instead of presenting the score as a reliable cross-period predictor. */
 export interface PropensityTimeSplit {
   split: string; // the listing date the split falls on
   n: number; // newer-half protocols scored
   roc_auc: number; // area under the ROC curve on the newer half
   brier: number; // mean squared error of the score against the label, newer half
   log_loss: number; // mean log loss of the score against the label, newer half
+  brier_baseline: number; // Brier score of always predicting the training-set base rate, newer half
+  log_loss_baseline: number; // log loss of always predicting the training-set base rate, newer half
 }
 
 /** The fitted tokenization-propensity score: the weights in standardised feature space, the
@@ -210,10 +230,11 @@ export interface PropensityModel {
   time_split: PropensityTimeSplit; // the same quality numbers on the newer half, by listing date
 }
 
-/** What the holdout tests say about the value model: the median miss of the radar-3 value
- * formula against the flat TVL multiple, leave-one-out and by-time, plus the error
- * distribution the printed ranges are cut from and the coverage those ranges achieve on
- * held-out caps. */
+/** What the holdout tests say about the value model: the median miss of the chosen blended
+ * value (radar formula and flat TVL multiple, log-space blend at the rolling-chosen alpha)
+ * against the flat TVL multiple, leave-one-out and by-time, plus the error distribution
+ * the printed ranges are cut from and the coverage those ranges achieve on held-out caps.
+ * The printed range is the Central 60% model range (P20-P80), not P25-P75. */
 export interface HoldoutSummary {
   loo_n: number; // traded tokens priced leave-one-out
   loo_median_miss: number; // median miss of the value formula, leave-one-out
@@ -226,17 +247,52 @@ export interface HoldoutSummary {
   bytime_train_log_median: number; // median raw log error of the older half — the scale the by-time test calibrates on
   bytime_test_log_median: number; // median raw log error of the newer half before calibration — the scale the test actually needs; the gap between the two is the scale drift
   log_p10: number; // 10th percentile of the nested leave-one-out log error
-  log_p25: number; // 25th percentile
+  log_p20: number; // 20th percentile
   log_p50: number; // median
-  log_p75: number; // 75th percentile
+  log_p80: number; // 80th percentile
   log_p90: number; // 90th percentile
   log_p50_raw: number; // median of the raw (pre-calibration) leave-one-out log errors — the scale the traded tokens imply, used to set the value base; the reported misses above are nested and never reuse it
-  range_lo_factor: number; // exp(P25): the low end of the printed P25-P75 range
-  range_hi_factor: number; // exp(P75)
+  range_lo_factor: number; // exp(P20): the low end of the printed Central 60% range
+  range_hi_factor: number; // exp(P80)
   range_lo10_factor: number; // exp(P10)
   range_hi90_factor: number; // exp(P90)
-  coverage_2575: number; // share of by-time held-out caps inside the printed P25-P75 range
+  coverage_central60: number; // share of by-time held-out caps inside the printed Central 60% range
   coverage_1090: number; // share inside the printed P10-P90 range
+}
+
+/** One rolling test block: the consecutive traded tokens listed after the training set,
+ * priced from prior data only, with the flat baseline and the chosen model side by side. */
+export interface RollingBlock {
+  block: number; // 1-based block number
+  start: string; // first listing date in the block
+  end: string; // last listing date in the block
+  n: number; // test protocols in the block
+  train_n: number; // training protocols before the block
+  flat_median_miss: number; // flat TVL median miss on the block
+  chosen_median_miss: number; // median miss of the chosen model on the block
+  alpha_median_miss: number[]; // median miss per alpha in BLEND_ALPHAS order, on the block
+  central60_coverage: number; // chosen model: share of the block inside the Central 60% range
+  p1090_coverage: number; // chosen model: share of the block inside P10-P90
+}
+
+/** The strict rolling validation: the dated traded tokens, ordered by listing date, split
+ * into an initial training set and four consecutive test blocks. The first three blocks
+ * pick alpha among the alphas that pass the gate; the fourth block is held out as final
+ * validation — it can only veto through the gate, never pick. When no alpha passes the
+ * gate the board falls back to the flat TVL multiple. */
+export interface RollingValidation {
+  alphas: number[]; // the blend weights compared, [0, 0.25, 0.5, 0.75, 1]
+  dated_n: number; // dated traded tokens the rolling runs on
+  initial_n: number; // initial training set size
+  block_n: number; // test protocols per block
+  pooled_miss_by_alpha: number[]; // pooled median miss on blocks 1-3, per alpha
+  pooled_miss_all_by_alpha: number[]; // pooled median miss on all 4 blocks, per alpha
+  flat_pooled_miss: number; // flat pooled median miss, blocks 1-3
+  flat_pooled_miss_all: number; // flat pooled median miss, all 4 blocks
+  gate_by_alpha: boolean[]; // per-alpha gate result: 10% below flat overall, 3/4 blocks better, last block not clearly worse
+  chosen_alpha: number; // the blend weight the board uses: the best gate-passing alpha on blocks 1-3, or 0 for the flat fallback
+  board_uses_flat: boolean; // true when no alpha passed the gate and the board falls back to flat TVL
+  blocks: RollingBlock[]; // the four test blocks, in listing order
 }
 
 /** One group of the snapshot's protocols, by what happened to them: ranked on the board, a
@@ -250,18 +306,18 @@ export interface AccountingGroup {
 
 /** The farm verdict's constants: the three drop-share scenarios, the two plan sizes, the gas
  * a plan costs on Ethereum and elsewhere, the annual cost of the capital, and the net
- * threshold. Gas is a conservative budget, not a live quote: a 30-day plan runs 7
- * transactions (approve + deposit 2, weekly actions 4, withdraw 1), so the gas a plan
- * deducts is 7 x the per-transaction figure. No scenario is evidence: the shares are
- * scenarios, and the verdicts are stated against them — Farm when even the conservative
- * drop clears the threshold on the $1,000 plan. */
+ * threshold. Gas is a conservative budget, not a live quote, and it follows the hold: a
+ * plan runs 2 setup transactions (approve + deposit), one weekly action per full week,
+ * and 1 exit — Ntx = 3 + floor(holdDays / 7) — so a 30-day plan runs 7, a 45-day plan 9,
+ * a 60-day plan 11, each transaction priced on the chain it actually runs on. No scenario
+ * is evidence: the shares are scenarios, and the verdicts are stated against them — Farm
+ * when even the conservative drop clears the threshold on the $1,000 plan. */
 export interface FarmConstants {
   drop_share_conservative: number; // drop share in the conservative scenario
   drop_share_neutral: number; // drop share in the neutral scenario
   drop_share_optimistic: number; // drop share in the optimistic scenario
   plan_small: number; // small plan size, dollars
   plan_large: number; // large plan size, dollars
-  gas_transactions: number; // transactions a 30-day plan runs: approve+deposit 2, weekly 4, withdraw 1
   gas_ethereum: number; // gas per transaction on Ethereum, dollars
   gas_other: number; // gas per transaction elsewhere, dollars
   opportunity_rate: number; // annual cost of the capital
@@ -271,8 +327,35 @@ export interface FarmConstants {
 export const FARM: FarmConstants = { // the constants the dashboard prints
   drop_share_conservative: 0.01, drop_share_neutral: 0.03, drop_share_optimistic: 0.07,
   plan_small: 1000, plan_large: 10000,
-  gas_transactions: 7, gas_ethereum: 11.5, gas_other: 3, opportunity_rate: 0.05, farm_threshold: 10,
+  gas_ethereum: 11.5, gas_other: 3, opportunity_rate: 0.05, farm_threshold: 10,
 };
+
+/** Transactions a farm plan runs for a hold of `holdDays`: 2 setup (approve + deposit),
+ * one weekly action per full week, 1 exit — Ntx = 3 + floor(holdDays / 7). A 30-day plan
+ * runs 7, a 45-day plan 9, a 60-day plan 11. */
+export function gasTransactionsFor(holdDays: number): number {
+  return 3 + Math.floor(holdDays / 7);
+}
+
+/** Gas per transaction on a chain: Ethereum $11.50, elsewhere $3.00 — a conservative
+ * budget assumption, not a live quote. */
+function gasPerTx(chain: string): number {
+  return chain === 'Ethereum' ? FARM.gas_ethereum : FARM.gas_other;
+}
+
+/** The gas a farm plan deducts: setup (2) and exit (1) on the protocol's first chain, the
+ * weekly actions alternating between its first and second chain, each transaction priced
+ * on the chain it actually runs on. */
+export function gasForPlan(entry: SnapshotProtocol, holdDays: number): number {
+  const first = entry.chains[0] ?? '';
+  const second = entry.chains[1] ?? null;
+  const weekly = Math.floor(holdDays / 7);
+  let total = 2 * gasPerTx(first) + gasPerTx(first);
+  for (let w = 0; w < weekly; w++) {
+    total += gasPerTx(w % 2 === 0 ? first : (second ?? first));
+  }
+  return Math.round(total * 100) / 100;
+}
 
 /** A board.json row: one ranked protocol. */
 export interface BoardRow {
@@ -290,16 +373,16 @@ export interface BoardRow {
   age_days: number | null; // days since listing, when known
   token_status: 'pre-token'; // always pre-token on the board
   implied_value_usd: number; // the launch value (value-if-it-launches, rounded) — the primary USD value and the ranking value
-  value_if_launches_usd: number; // the radar-3 value formula, unrounded, before any propensity is applied
+  value_if_launches_usd: number; // the board's launch value (blended radar/flat), rounded, before any propensity is applied
   propensity: number; // tokenization propensity score, 0..1 — cross-sectional, not a launch probability
   priority_score: number; // launch value times propensity — a unitless sort aid, never labelled USD
-  range_lo_usd: number; // P25 end of the printed range, from the holdout error distribution
-  range_hi_usd: number; // P75 end of the printed range
+  range_lo_usd: number; // P20 end of the printed Central 60% range, from the holdout error distribution
+  range_hi_usd: number; // P80 end of the printed range
   range_lo10_usd: number; // P10 end of the printed range
   range_hi90_usd: number; // P90 end of the printed range
   farm_verdict: FarmVerdict; // Farm, Marginal or Skip, judged on each plan size independently
   farm_plan_size: number; // the plan size the verdict and the farm steps use: $1,000, or $10,000 for a Marginal earned on the large plan
-  plan_state: PlanState; // Verified, Conditional or Research first — how executable the farm plan is
+  plan_state: PlanState; // Category-supported, Conditional or Research first — how executable the farm plan is
   net_1000_usd: number; // conditional net of farming at the $1,000 plan size, neutral 3% drop, assuming launch and a pro-rata drop allocation — not an expected return
   net_10000_usd: number; // conditional net of farming at the $10,000 plan size, neutral 3% drop, same assumption
   net_1000_conservative_usd: number; // conditional net at the $1,000 plan size, conservative 1% drop
@@ -328,16 +411,16 @@ export interface RadarRow {
   listed_at: string | null; // listing date
   age_days: number | null; // days since listing, when known
   implied_value_usd: number; // the launch value — the primary USD value and the ranking value
-  value_if_launches_usd: number; // the radar-3 value formula, unrounded, before any propensity is applied
+  value_if_launches_usd: number; // the board's launch value (blended radar/flat), rounded, before any propensity is applied
   propensity: number; // tokenization propensity score, 0..1 — cross-sectional, not a launch probability
   priority_score: number; // launch value times propensity — a unitless sort aid, never labelled USD
-  range_lo_usd: number; // P25 end of the printed range, from the holdout error distribution
-  range_hi_usd: number; // P75 end of the printed range
+  range_lo_usd: number; // P20 end of the printed Central 60% range, from the holdout error distribution
+  range_hi_usd: number; // P80 end of the printed range
   range_lo10_usd: number; // P10 end of the printed range
   range_hi90_usd: number; // P90 end of the printed range
   farm_verdict: FarmVerdict; // Farm, Marginal or Skip, judged on each plan size independently
   farm_plan_size: number; // the plan size the verdict and the farm steps use: $1,000, or $10,000 for a Marginal earned on the large plan
-  plan_state: PlanState; // Verified, Conditional or Research first — how executable the farm plan is
+  plan_state: PlanState; // Category-supported, Conditional or Research first — how executable the farm plan is
   net_1000_usd: number; // conditional net of farming at the $1,000 plan size, neutral 3% drop
   net_10000_usd: number; // conditional net of farming at the $10,000 plan size, neutral 3% drop
   net_1000_conservative_usd: number; // conditional net at the $1,000 plan size, conservative 1% drop
@@ -419,10 +502,13 @@ export interface RadarData {
   live_size: number; // live-token row count
   live: LiveRow[]; // live-token protocols, by market cap
   rows: RadarRow[]; // ranked rows, compact form
-  comparison: ModelComparison; // radar-2 versus radar-6, computed by the build
+  comparison: ModelComparison; // radar-2 versus radar-7, computed by the build
   propensity: PropensityModel; // the fitted tokenization-propensity score, so the page recomputes every row's score
   age_ablation: AgeAblation; // the three feature specs side by side and whether log age survived
   holdout: HoldoutSummary; // what the out-of-sample holdout tests say about the value model
+  blend_alpha: number; // the log-space blend weight the board uses: 1 radar alone, 0 flat TVL alone
+  flat_multiple: number; // median market-cap-to-TVL over all traded tokens — the flat baseline
+  rolling: RollingValidation; // the strict rolling validation that chose the blend weight
   accounting: AccountingGroup[]; // all snapshot protocols, grouped by outcome or reason
   verdict_counts: { farm: number; marginal: number; skip: number }; // farm verdicts on the board
   total_implied_usd: number; // sum of launch value across the board
@@ -463,12 +549,14 @@ export function ageDays(
   return days < 0 ? 0 : days;
 }
 
-/** The board-wide figures the radar-6 score is anchored on. The TVL anchor is one definition
+/** The board-wide figures the radar-7 score is anchored on. The TVL anchor is one definition
  * everywhere: the traded-token median, shrunk by category toward the global median. */
 export interface ModelContext {
   anchorByCategory: Map<string, number>; // unified TVL anchor per category (traded-token, shrunk)
   globalAnchor: number; // global traded-token median TVL
   categoryMedian: Map<string, number>; // median seven-day change per category, over the board's rows
+  blendAlpha: number; // log-space blend weight: 1 radar alone, 0 flat TVL alone
+  flatMultiple: number; // median market-cap-to-TVL over all traded tokens — the flat baseline
 }
 
 /**
@@ -509,9 +597,12 @@ export function anchorFor(
   return anchors.byCategory.get(category ?? 'Other') ?? anchors.global;
 }
 
-/** One protocol's factors and launch value under the radar-6 formula: the same sub-linear
+/** One protocol's factors and launch value under the radar-7 formula: the same sub-linear
  * TVL base, now anchored on the unified traded-token anchor, category-relative growth and
- * chain factor. No propensity is applied here: the launch value is the primary USD value,
+ * chain factor, blended in log space with the flat TVL multiple at the rolling-chosen
+ * alpha — ln V = alpha x ln V_radar + (1 - alpha) x ln V_flat. Alpha 1 is the radar
+ * formula alone, alpha 0 the flat multiple alone (the fallback when no blend passes the
+ * rolling gate). No propensity is applied here: the launch value is the primary USD value,
  * and the propensity stays a separate indicator. */
 export function impliedValue(
   protocol: SnapshotProtocol,
@@ -528,7 +619,11 @@ export function impliedValue(
     : 1 + model.growth_weight * Math.tanh((protocol.change_7d - catMedian) / model.growth_scale);
   const chainBonus = Math.max(0, Math.min(protocol.chains.length - 1, model.chain_max_steps));
   const chainFactor = 1 + chainBonus * model.chain_step;
-  const launchValue = Math.max(1, Math.round(tvlBase * growthFactor * chainFactor));
+  const radarValue = tvlBase * growthFactor * chainFactor;
+  const flatValue = ctx.flatMultiple * protocol.tvl_usd;
+  const alpha = ctx.blendAlpha;
+  const blended = alpha >= 1 ? radarValue : alpha <= 0 ? flatValue : Math.exp(alpha * Math.log(Math.max(1, radarValue)) + (1 - alpha) * Math.log(Math.max(1, flatValue)));
+  const launchValue = Math.max(1, Math.round(blended));
   return { launchValue, tvlBase, growthFactor, categoryMedian: catMedian, chainFactor, age: protocolAge, anchor };
 }
 
@@ -837,7 +932,7 @@ function evaluatePropensitySpec(
     .map((entry, i) => ({ entry, i }))
     .filter(({ entry }) => entry.listed_at !== null)
     .sort((a, b) => (a.entry.listed_at! < b.entry.listed_at! ? -1 : a.entry.listed_at! > b.entry.listed_at! ? 1 : a.entry.slug < b.entry.slug ? -1 : a.entry.slug > b.entry.slug ? 1 : 0));
-  let timeSplit: PropensityTimeSplit = { split: '', n: 0, roc_auc: 0, brier: 0, log_loss: 0 };
+  let timeSplit: PropensityTimeSplit = { split: '', n: 0, roc_auc: 0, brier: 0, log_loss: 0, brier_baseline: 0, log_loss_baseline: 0 };
   let tsSubOlderAuc = 0.5;
   let tsSubNewerAuc = 0.5;
   if (dated.length >= 4) {
@@ -858,12 +953,23 @@ function evaluatePropensitySpec(
       p: scoreWith(entry, snapshot.as_of, olderFit, olderTotal, olderLaunched, null, spec),
       y: y[i]!,
     }));
+    // The time-split baselines: what always predicting the training set's base rate scores
+    // on the newer half. Brier is the mean squared error of the base rate against the
+    // label; log loss is the cross-entropy of the test label mix under the training rate.
+    // When the model is worse than its baseline, the dashboard says "below baseline".
+    const trainBase = olderY.reduce((sum, v) => sum + v, 0) / olderY.length;
+    const testBase = newerPairs.reduce((sum, pair) => sum + pair.y, 0) / newerPairs.length;
+    const clippedBase = Math.max(1e-9, Math.min(1 - 1e-9, trainBase));
+    const brierBaseline = Math.round((newerPairs.reduce((sum, pair) => sum + (pair.y - trainBase) * (pair.y - trainBase), 0) / newerPairs.length) * 10000) / 10000;
+    const logLossBaseline = Math.round((-testBase * Math.log(clippedBase) - (1 - testBase) * Math.log(1 - clippedBase)) * 10000) / 10000;
     timeSplit = {
       split: newer[0]!.entry.listed_at!,
       n: newer.length,
       roc_auc: rocAuc(newerPairs),
       brier: brierScore(newerPairs),
       log_loss: logLoss(newerPairs),
+      brier_baseline: brierBaseline,
+      log_loss_baseline: logLossBaseline,
     };
     const subHalf = Math.floor(newerPairs.length / 2);
     tsSubOlderAuc = rocAuc(newerPairs.slice(0, subHalf));
@@ -960,7 +1066,7 @@ function quantile(ordered: number[], q: number): number {
   return ordered[lo]! + (ordered[hi]! - ordered[lo]!) * (pos - lo);
 }
 
-/** One protocol's value under the radar-6 formula, with anchors fitted on the priced set
+/** One protocol's value under the radar-7 formula, with anchors fitted on the priced set
  * given: the traded-token anchor (shrunk by category, the one definition shared with the
  * board) and the category growth medians, so the holdout tests the formula's shape, not
  * the board's numbers. */
@@ -978,6 +1084,112 @@ function valueForHoldout(
     : 1 + model.growth_weight * Math.tanh((entry.change_7d - catMedian) / model.growth_scale);
   const chainBonus = Math.max(0, Math.min(entry.chains.length - 1, model.chain_max_steps));
   return Math.max(1, Math.round(tvlBase * growth * (1 + chainBonus * model.chain_step)));
+}
+
+/** The blend weights compared in the rolling validation, in log space: 0 is the flat TVL
+ * multiple alone, 1 the radar formula alone. */
+export const BLEND_ALPHAS: number[] = [0, 0.25, 0.5, 0.75, 1];
+
+/** Everything a priced set implies: its unified anchor, its category growth medians, and
+ * its flat TVL multiple (median market-cap-to-TVL). One definition for the board and the
+ * holdout alike; the fitting set differs by context, as honest validation requires. */
+export interface PricedSet {
+  anchors: { global: number; byCategory: Map<string, number> };
+  catMedians: Map<string, number>;
+  flatMultiple: number;
+}
+
+/** The priced set a group of traded tokens implies: anchors, category medians and the flat
+ * multiple, all from that group alone. */
+export function pricedSetFor(priced: SnapshotProtocol[]): PricedSet {
+  const anchors = tvlAnchors(priced);
+  const medians = holdoutMedians(priced);
+  return { anchors, catMedians: medians.catMedians, flatMultiple: medians.flatMultiple };
+}
+
+/** One protocol's blended value under a priced set: ln V = alpha x ln V_radar + (1 - alpha)
+ * x ln V_flat, where V_radar is the radar formula at the model's base and V_flat is the
+ * priced set's flat multiple times TVL. Alpha 1 is the radar formula alone, alpha 0 the
+ * flat multiple alone. The result is uncalibrated: the caller scales the RADAR component
+ * by the scale factor the priced set implies — the flat multiple is already a median and
+ * needs no scale — so at alpha 1 the whole prediction carries the scale and at alpha 0 it
+ * carries none. */
+export function blendedValue(
+  entry: SnapshotProtocol,
+  set: PricedSet,
+  model: ModelConstants,
+  alpha: number,
+): number {
+  const radar = valueForHoldout(entry, set.anchors, set.catMedians, model);
+  if (alpha >= 1) return radar;
+  const flat = Math.max(1, Math.round(set.flatMultiple * entry.tvl_usd));
+  if (alpha <= 0) return flat;
+  return Math.max(1, Math.round(Math.exp(alpha * Math.log(radar) + (1 - alpha) * Math.log(flat))));
+}
+
+/** The nested leave-one-out pass over a traded set under one blend: pass one prices every
+ * token from the others' priced set, keeping the radar and flat components apart; pass two
+ * scales each prediction by the median log error of the others — but the scale belongs to
+ * the radar component alone. The radar formula's base is arbitrary and needs the traded
+ * tokens' median raw log error, while the flat multiple is already a median and needs no
+ * correction: scaling the whole blend would add pure noise to the flat component (its raw
+ * log errors already centre on zero), so the correction is computed from the radar's raw
+ * log errors and applied to the radar component only. At alpha 1 this is identical to
+ * scaling the blend; at alpha 0 the blend is the flat multiple untouched. The median raw
+ * log error is the scale the set implies — the board's base comes from it — and the nested
+ * log errors are the distribution the printed ranges are cut from. */
+export interface NestedLoo {
+  misses: number[]; // per-sample median miss of the blended value, nested calibration
+  flatMisses: number[]; // per-sample miss of the flat TVL multiple
+  logErrors: number[]; // nested log errors, log(actual / predicted)
+  rawLogErrors: number[]; // raw (pre-calibration) log errors
+  p50Raw: number; // median raw log error
+}
+
+export function nestedLoo(
+  traded: SnapshotProtocol[],
+  model: ModelConstants,
+  alpha: number,
+): NestedLoo {
+  const radarRaw: number[] = [];
+  const flatPredicted: number[] = [];
+  const rawLogErrors: number[] = [];
+  const radarLogErrors: number[] = [];
+  for (let i = 0; i < traded.length; i++) {
+    const entry = traded[i]!;
+    const others = traded.filter((_, j) => j !== i);
+    const set = pricedSetFor(others);
+    const radar = valueForHoldout(entry, set.anchors, set.catMedians, model);
+    const flat = Math.max(1, Math.round(set.flatMultiple * entry.tvl_usd));
+    radarRaw.push(radar);
+    flatPredicted.push(flat);
+    const blended = alpha >= 1 ? radar : alpha <= 0 ? flat : Math.max(1, Math.round(Math.exp(alpha * Math.log(radar) + (1 - alpha) * Math.log(flat))));
+    rawLogErrors.push(Math.log(entry.mcap_usd! / blended));
+    radarLogErrors.push(Math.log(entry.mcap_usd! / radar));
+  }
+  const misses: number[] = [];
+  const flatMisses: number[] = [];
+  const logErrors: number[] = [];
+  for (let i = 0; i < traded.length; i++) {
+    const othersLog: number[] = [];
+    for (let j = 0; j < traded.length; j++) {
+      if (j === i) continue;
+      othersLog.push(radarLogErrors[j]!);
+    }
+    const kI = Math.exp(median(othersLog.sort((a, b) => a - b)) ?? 0);
+    const radarCal = radarRaw[i]! * kI;
+    const predicted = Math.max(1, Math.round(
+      alpha >= 1 ? radarCal : alpha <= 0 ? flatPredicted[i]! : Math.exp(alpha * Math.log(Math.max(1, radarCal)) + (1 - alpha) * Math.log(flatPredicted[i]!)),
+    ));
+    const actual = traded[i]!.mcap_usd!;
+    misses.push(Math.max(predicted / actual, actual / predicted));
+    flatMisses.push(Math.max(flatPredicted[i]! / actual, actual / flatPredicted[i]!));
+    logErrors.push(Math.log(actual / predicted));
+  }
+  return {
+    misses, flatMisses, logErrors, rawLogErrors,
+    p50Raw: median([...rawLogErrors].sort((a, b) => a - b)) ?? 0,
+  };
 }
 
 /** The medians a priced set gives: its per-category median seven-day change and its median
@@ -1004,76 +1216,50 @@ function holdoutMedians(
 }
 
 /**
- * The out-of-sample holdout tests on the traded-token protocols, with NESTED calibration:
- * leave-one-out (each token priced from a fit on the others, and its own scale factor k_i
- * taken from the others' log errors, so its own market cap never enters its own
- * calibration) and by-time (the older half, by listing date, fits the model and the scale
- * factor that prices the newer half), each against a flat TVL-multiple baseline. The printed
- * ranges are cut from the nested leave-one-out log-error distribution, and their coverage is
+ * The out-of-sample holdout tests on the traded-token protocols, under the blend `alpha`,
+ * with NESTED calibration: leave-one-out (each token priced from a fit on the others, and
+ * its own scale factor k_i taken from the others' log errors, so its own market cap never
+ * enters its own calibration) and by-time (the older half, by listing date, fits the model
+ * and the scale factor that prices the newer half), each against a flat TVL-multiple
+ * baseline. The printed ranges are cut from the nested leave-one-out log-error
+ * distribution — the Central 60% model range (P20-P80) and P10-P90 — and their coverage is
  * measured on the by-time held-out caps, so the coverage number is itself out of sample.
  */
 export function holdoutValidation(
   snapshot: Snapshot,
   model: ModelConstants = MODEL,
+  alpha: number = 1,
 ): HoldoutSummary {
   const empty: HoldoutSummary = {
     loo_n: 0, loo_median_miss: 0, loo_flat_median_miss: 0, loo_within_2x: 0,
     bytime_n: 0, bytime_split: '', bytime_median_miss: 0, bytime_flat_median_miss: 0,
     bytime_train_log_median: 0, bytime_test_log_median: 0,
-    log_p10: 0, log_p25: 0, log_p50: 0, log_p75: 0, log_p90: 0, log_p50_raw: 0,
+    log_p10: 0, log_p20: 0, log_p50: 0, log_p80: 0, log_p90: 0, log_p50_raw: 0,
     range_lo_factor: 0, range_hi_factor: 0, range_lo10_factor: 0, range_hi90_factor: 0,
-    coverage_2575: 0, coverage_1090: 0,
+    coverage_central60: 0, coverage_1090: 0,
   };
   const traded = snapshot.protocols
     .filter((entry) => entry.mcap_usd !== null && entry.mcap_usd > 0 && entry.tvl_usd > 0)
     .sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
   if (traded.length < 2) return empty;
-  // Pass one: the raw prediction for every traded token, each from the others' anchors —
-  // a token's own market cap never enters its own prediction. The median raw log error is
-  // the scale the traded tokens imply; it sets the value base, and it is reported as
-  // log_p50_raw so the board's base can be audited — the misses below never reuse it.
-  const raw: number[] = [];
-  const flatPredicted: number[] = [];
-  const rawLogErrors: number[] = [];
-  for (let i = 0; i < traded.length; i++) {
-    const entry = traded[i]!;
-    const others = traded.filter((_, j) => j !== i);
-    const anchors = tvlAnchors(others);
-    const medians = holdoutMedians(others);
-    const predicted = valueForHoldout(entry, anchors, medians.catMedians, model);
-    raw.push(predicted);
-    flatPredicted.push(Math.max(1, Math.round(medians.flatMultiple * entry.tvl_usd)));
-    rawLogErrors.push(Math.log(entry.mcap_usd! / predicted));
-  }
-  // Pass two: nested calibration — sample i's scale factor is the median log error of the
-  // OTHERS, so the number reported for i is genuinely out of sample. The median nested log
-  // error is near zero by construction, so it is not a scale estimate; the scale comes from
-  // the raw errors above.
-  const misses: number[] = [];
-  const flatMisses: number[] = [];
-  const logErrors: number[] = [];
-  for (let i = 0; i < traded.length; i++) {
-    const othersLog: number[] = [];
-    for (let j = 0; j < traded.length; j++) {
-      if (j === i) continue;
-      othersLog.push(rawLogErrors[j]!);
-    }
-    const kI = Math.exp(median(othersLog.sort((a, b) => a - b)) ?? 0);
-    const predicted = Math.max(1, Math.round(raw[i]! * kI));
-    const actual = traded[i]!.mcap_usd!;
-    misses.push(Math.max(predicted / actual, actual / predicted));
-    flatMisses.push(Math.max(flatPredicted[i]! / actual, actual / flatPredicted[i]!));
-    logErrors.push(Math.log(actual / predicted));
-  }
+  // The nested leave-one-out pass, under the blend being evaluated: pass one prices every
+  // traded token from the others' priced set, pass two scales each prediction by the median
+  // log error of the others. The median raw log error is the scale the traded tokens
+  // imply; it sets the value base, and it is reported as log_p50_raw so the board's base
+  // can be audited — the misses below never reuse it.
+  const loo = nestedLoo(traded, model, alpha);
+  const misses = loo.misses;
+  const flatMisses = loo.flatMisses;
+  const logErrors = loo.logErrors;
   const sortedLog = [...logErrors].sort((a, b) => a - b);
   const p10 = quantile(sortedLog, 0.1);
-  const p25 = quantile(sortedLog, 0.25);
+  const p20 = quantile(sortedLog, 0.2);
   const p50 = quantile(sortedLog, 0.5);
-  const p75 = quantile(sortedLog, 0.75);
+  const p80 = quantile(sortedLog, 0.8);
   const p90 = quantile(sortedLog, 0.9);
-  const p50Raw = median([...rawLogErrors].sort((a, b) => a - b)) ?? 0;
-  const rangeLo = round4(Math.exp(p25));
-  const rangeHi = round4(Math.exp(p75));
+  const p50Raw = loo.p50Raw;
+  const rangeLo = round4(Math.exp(p20));
+  const rangeHi = round4(Math.exp(p80));
   const rangeLo10 = round4(Math.exp(p10));
   const rangeHi90 = round4(Math.exp(p90));
   const within2x = misses.filter((m) => m <= 2).length / misses.length;
@@ -1086,33 +1272,40 @@ export function holdoutValidation(
   let bytimeFlatMiss = 0;
   let bytimeTrainLogMedian = 0;
   let bytimeTestLogMedian = 0;
-  let coverage2575 = 0;
+  let coverageCentral60 = 0;
   let coverage1090 = 0;
   if (dated.length >= 4) {
     const half = Math.floor(dated.length / 2);
     const older = dated.slice(0, half);
     const newer = dated.slice(half);
-    const anchors = tvlAnchors(older);
-    const medians = holdoutMedians(older);
+    const trainSet = pricedSetFor(older);
     // The by-time scale factor comes from the OLD samples only, fixed before any newer
-    // sample is priced: each old sample is priced from the old set's anchors, the median
-    // of their log errors sets k_train, and the newer half is priced with it. No newer
-    // market cap enters the calibration.
-    const trainLog = older.map((entry) => Math.log(entry.mcap_usd! / valueForHoldout(entry, anchors, medians.catMedians, model)));
-    const kTrain = Math.exp(median(trainLog.sort((a, b) => a - b)) ?? 0);
+    // sample is priced — and it belongs to the radar component alone, as in the nested
+    // leave-one-out pass: the radar formula's base is arbitrary and needs the scale, the
+    // flat multiple is already a median. Each old sample's radar value is priced from the
+    // old set's priced set, the median of their log errors sets k_train, and the newer half
+    // is priced with the radar component scaled by it. No newer market cap enters the
+    // calibration. The train and test log medians below are the blend's raw log errors —
+    // the scale drift between the halves — not the calibrated ones.
+    const trainRadarLog = older.map((entry) => Math.log(entry.mcap_usd! / valueForHoldout(entry, trainSet.anchors, trainSet.catMedians, model)));
+    const kTrain = Math.exp(median(trainRadarLog.sort((a, b) => a - b)) ?? 0);
+    const trainLog = older.map((entry) => Math.log(entry.mcap_usd! / blendedValue(entry, trainSet, model, alpha)));
     const trainLogMedian = median([...trainLog].sort((a, b) => a - b)) ?? 0;
-    const testLogMedian = median(newer.map((entry) => Math.log(entry.mcap_usd! / valueForHoldout(entry, anchors, medians.catMedians, model))).sort((a, b) => a - b)) ?? 0;
+    const testLogMedian = median(newer.map((entry) => Math.log(entry.mcap_usd! / blendedValue(entry, trainSet, model, alpha))).sort((a, b) => a - b)) ?? 0;
     const byMisses: number[] = [];
     const byFlatMisses: number[] = [];
-    let in2575 = 0;
+    let inCentral60 = 0;
     let in1090 = 0;
     for (const entry of newer) {
-      const predicted = Math.max(1, Math.round(valueForHoldout(entry, anchors, medians.catMedians, model) * kTrain));
-      const flatPredicted = Math.max(1, Math.round(medians.flatMultiple * entry.tvl_usd));
+      const radar = valueForHoldout(entry, trainSet.anchors, trainSet.catMedians, model) * kTrain;
+      const flat = trainSet.flatMultiple * entry.tvl_usd;
+      const blended = alpha >= 1 ? radar : alpha <= 0 ? flat : Math.exp(alpha * Math.log(Math.max(1, radar)) + (1 - alpha) * Math.log(Math.max(1, flat)));
+      const predicted = Math.max(1, Math.round(blended));
+      const flatPredicted = Math.max(1, Math.round(trainSet.flatMultiple * entry.tvl_usd));
       const actual = entry.mcap_usd!;
       byMisses.push(Math.max(predicted / actual, actual / predicted));
       byFlatMisses.push(Math.max(flatPredicted / actual, actual / flatPredicted));
-      if (predicted * rangeLo <= actual && actual <= predicted * rangeHi) in2575++;
+      if (predicted * rangeLo <= actual && actual <= predicted * rangeHi) inCentral60++;
       if (predicted * rangeLo10 <= actual && actual <= predicted * rangeHi90) in1090++;
     }
     bytimeN = newer.length;
@@ -1121,7 +1314,7 @@ export function holdoutValidation(
     bytimeFlatMiss = median(byFlatMisses.sort((a, b) => a - b)) ?? 0;
     bytimeTrainLogMedian = trainLogMedian;
     bytimeTestLogMedian = testLogMedian;
-    coverage2575 = Math.round((in2575 / newer.length) * 10000) / 10000;
+    coverageCentral60 = Math.round((inCentral60 / newer.length) * 10000) / 10000;
     coverage1090 = Math.round((in1090 / newer.length) * 10000) / 10000;
   }
   return {
@@ -1132,11 +1325,182 @@ export function holdoutValidation(
     bytime_n: bytimeN, bytime_split: bytimeSplit,
     bytime_median_miss: round4(bytimeMiss), bytime_flat_median_miss: round4(bytimeFlatMiss),
     bytime_train_log_median: round4(bytimeTrainLogMedian), bytime_test_log_median: round4(bytimeTestLogMedian),
-    log_p10: round4(p10), log_p25: round4(p25), log_p50: round4(p50),
-    log_p75: round4(p75), log_p90: round4(p90), log_p50_raw: round4(p50Raw),
+    log_p10: round4(p10), log_p20: round4(p20), log_p50: round4(p50),
+    log_p80: round4(p80), log_p90: round4(p90), log_p50_raw: round4(p50Raw),
     range_lo_factor: rangeLo, range_hi_factor: rangeHi,
     range_lo10_factor: rangeLo10, range_hi90_factor: rangeHi90,
-    coverage_2575: coverage2575, coverage_1090: coverage1090,
+    coverage_central60: coverageCentral60, coverage_1090: coverage1090,
+  };
+}
+
+/**
+ * The strict rolling validation: the dated traded tokens, ordered by listing date, split
+ * into an initial training set (the first half) and four consecutive test blocks. Each
+ * block is priced from prior data only — its anchor, category medians, flat multiple and
+ * scale factor all come from the training set before it — so no future sample enters any
+ * block's calibration. The first three blocks pick alpha among the alphas that pass the
+ * gate; the fourth block is held out as final validation and can only veto through the
+ * gate, never pick. The gate: the chosen blend's pooled median miss over all four blocks
+ * at least 10% below flat, at least 3 of 4 blocks better than flat, and the held-out last
+ * block not more than 10% worse than flat. When no alpha passes, the board falls back to
+ * the flat TVL multiple.
+ *
+ * One adaptation the snapshot forces: 95 of the 128 traded tokens carry a listing date,
+ * so the rolling runs on 95 — an initial 47 and four blocks of 12 — not the 64 + 4x16 the
+ * full 128 would give. Undated tokens sit out of the rolling; they stay in the
+ * leave-one-out and by-time checks.
+ */
+export function rollingValidation(
+  snapshot: Snapshot,
+): RollingValidation {
+  const empty: RollingValidation = {
+    alphas: [...BLEND_ALPHAS],
+    dated_n: 0, initial_n: 0, block_n: 0,
+    pooled_miss_by_alpha: BLEND_ALPHAS.map(() => 0),
+    pooled_miss_all_by_alpha: BLEND_ALPHAS.map(() => 0),
+    flat_pooled_miss: 0, flat_pooled_miss_all: 0,
+    gate_by_alpha: BLEND_ALPHAS.map(() => false),
+    chosen_alpha: 0, board_uses_flat: true,
+    blocks: [],
+  };
+  const traded = snapshot.protocols
+    .filter((entry) => entry.mcap_usd !== null && entry.mcap_usd > 0 && entry.tvl_usd > 0);
+  const dated = traded
+    .filter((entry) => entry.listed_at !== null)
+    .sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : a.listed_at! > b.listed_at! ? 1 : a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  if (dated.length < 8) return empty;
+  const initialN = Math.floor(dated.length / 2);
+  const rest = dated.length - initialN;
+  const blockSize = Math.floor(rest / 4);
+  if (blockSize < 1) return empty;
+  const blocks: SnapshotProtocol[][] = [];
+  for (let b = 0; b < 4; b++) {
+    const start = initialN + b * blockSize;
+    const end = b === 3 ? dated.length : start + blockSize;
+    blocks.push(dated.slice(start, end));
+  }
+  // Per block and per alpha: the block priced from prior data only. The training set's
+  // raw log errors under the round base set the block's scale factor, so the scale never
+  // sees the block it prices. Range endpoints come from the training set's nested
+  // leave-one-out log errors under the same alpha — prior data only, never the block.
+  const blockMiss: number[][] = []; // [block][alpha] median miss
+  const blockFlatMiss: number[] = [];
+  const blockCentral: number[][] = []; // [block][alpha] Central 60% coverage
+  const blockP1090: number[][] = []; // [block][alpha] P10-P90 coverage
+  const blockMisses: number[][][] = []; // [block][alpha] per-sample misses, for the pooled medians
+  const blockFlatMisses: number[][] = [];
+  for (let b = 0; b < 4; b++) {
+    const trainEnd = initialN + b * blockSize;
+    const train = dated.slice(0, trainEnd);
+    const test = blocks[b]!;
+    const trainSet = pricedSetFor(train);
+    const endpoints: Array<{ lo: number; hi: number; lo10: number; hi90: number }> = BLEND_ALPHAS.map((alpha) => {
+      const loo = nestedLoo(train, MODEL, alpha);
+      const ordered = [...loo.logErrors].sort((x, y) => x - y);
+      return {
+        lo: Math.exp(quantile(ordered, 0.2)),
+        hi: Math.exp(quantile(ordered, 0.8)),
+        lo10: Math.exp(quantile(ordered, 0.1)),
+        hi90: Math.exp(quantile(ordered, 0.9)),
+      };
+    });
+    const missRow: number[] = [];
+    const centralRow: number[] = [];
+    const p1090Row: number[] = [];
+    const missesRow: number[][] = [];
+    for (let a = 0; a < BLEND_ALPHAS.length; a++) {
+      const alpha = BLEND_ALPHAS[a]!;
+      const trainLog = train.map((entry) => Math.log(entry.mcap_usd! / blendedValue(entry, trainSet, MODEL, alpha)));
+      const kB = Math.exp(median(trainLog.sort((x, y) => x - y)) ?? 0);
+      const ep = endpoints[a]!;
+      const misses: number[] = [];
+      let inCentral = 0;
+      let in1090 = 0;
+      for (const entry of test) {
+        const predicted = Math.max(1, Math.round(blendedValue(entry, trainSet, MODEL, alpha) * kB));
+        const actual = entry.mcap_usd!;
+        misses.push(Math.max(predicted / actual, actual / predicted));
+        if (predicted * ep.lo <= actual && actual <= predicted * ep.hi) inCentral++;
+        if (predicted * ep.lo10 <= actual && actual <= predicted * ep.hi90) in1090++;
+      }
+      missRow.push(median([...misses].sort((x, y) => x - y)) ?? 0);
+      centralRow.push(Math.round((inCentral / test.length) * 10000) / 10000);
+      p1090Row.push(Math.round((in1090 / test.length) * 10000) / 10000);
+      missesRow.push(misses);
+    }
+    const flatMisses = test.map((entry) => {
+      const flat = Math.max(1, Math.round(trainSet.flatMultiple * entry.tvl_usd));
+      const actual = entry.mcap_usd!;
+      return Math.max(flat / actual, actual / flat);
+    });
+    blockMiss.push(missRow);
+    blockCentral.push(centralRow);
+    blockP1090.push(p1090Row);
+    blockMisses.push(missesRow);
+    blockFlatMiss.push(median([...flatMisses].sort((x, y) => x - y)) ?? 0);
+    blockFlatMisses.push(flatMisses);
+  }
+  // Pooled medians: blocks 1-3 pick alpha, all four blocks judge it.
+  const pooledByAlpha = BLEND_ALPHAS.map((_, a) => {
+    const pooled: number[] = [];
+    for (let b = 0; b < 3; b++) pooled.push(...blockMisses[b]![a]!);
+    return median(pooled.sort((x, y) => x - y)) ?? 0;
+  });
+  const pooledAllByAlpha = BLEND_ALPHAS.map((_, a) => {
+    const pooled: number[] = [];
+    for (let b = 0; b < 4; b++) pooled.push(...blockMisses[b]![a]!);
+    return median(pooled.sort((x, y) => x - y)) ?? 0;
+  });
+  const flatPooled = median(blockFlatMisses.slice(0, 3).flat().sort((x, y) => x - y)) ?? 0;
+  const flatPooledAll = median(blockFlatMisses.flat().sort((x, y) => x - y)) ?? 0;
+  // The gate, per alpha: (a) pooled median miss over all four blocks at least 10% below
+  // flat, (b) at least 3 of 4 blocks better than flat, (c) the held-out last block not
+  // more than 10% worse than flat.
+  const gateByAlpha = BLEND_ALPHAS.map((_, a) => {
+    const tenPct = pooledAllByAlpha[a]! <= 0.9 * flatPooledAll;
+    let better = 0;
+    for (let b = 0; b < 4; b++) if (blockMiss[b]![a]! < blockFlatMiss[b]!) better++;
+    const lastOk = blockMiss[3]![a]! <= 1.1 * blockFlatMiss[3]!;
+    return tenPct && better >= 3 && lastOk;
+  });
+  // Pick the best gate-passing alpha on blocks 1-3; only a strictly lower pooled miss
+  // replaces the pick, so ties keep the smaller alpha, the simpler model. When none
+  // passes, the board falls back to flat TVL.
+  let chosen = 0;
+  let bestPooled = Infinity;
+  for (let a = 0; a < BLEND_ALPHAS.length; a++) {
+    if (!gateByAlpha[a]) continue;
+    if (pooledByAlpha[a]! < bestPooled - 1e-9) {
+      bestPooled = pooledByAlpha[a]!;
+      chosen = BLEND_ALPHAS[a]!;
+    }
+  }
+  const boardUsesFlat = !gateByAlpha.some((g) => g);
+  const chosenAlpha = boardUsesFlat ? 0 : chosen;
+  const chosenIdx = BLEND_ALPHAS.indexOf(chosenAlpha);
+  const blocksOut: RollingBlock[] = blocks.map((test, b) => ({
+    block: b + 1,
+    start: test[0]!.listed_at!,
+    end: test[test.length - 1]!.listed_at!,
+    n: test.length,
+    train_n: initialN + b * blockSize,
+    flat_median_miss: round4(blockFlatMiss[b]!),
+    chosen_median_miss: round4(blockMiss[b]![chosenIdx]!),
+    alpha_median_miss: blockMiss[b]!.map((m) => round4(m)),
+    central60_coverage: blockCentral[b]![chosenIdx]!,
+    p1090_coverage: blockP1090[b]![chosenIdx]!,
+  }));
+  return {
+    alphas: [...BLEND_ALPHAS],
+    dated_n: dated.length, initial_n: initialN, block_n: blockSize,
+    pooled_miss_by_alpha: pooledByAlpha.map((m) => round4(m)),
+    pooled_miss_all_by_alpha: pooledAllByAlpha.map((m) => round4(m)),
+    flat_pooled_miss: round4(flatPooled),
+    flat_pooled_miss_all: round4(flatPooledAll),
+    gate_by_alpha: gateByAlpha,
+    chosen_alpha: chosenAlpha,
+    board_uses_flat: boardUsesFlat,
+    blocks: blocksOut,
   };
 }
 
@@ -1177,8 +1541,9 @@ export function accountingOf(snapshot: Snapshot): AccountingGroup[] {
  * it is not an expected return, and the launch odds are not multiplied in. The drop is
  * modelled as split by capital share of TVL — a simplification, stated as one in the
  * dashboard, since real drops pay on points and activity rather than TVL share. Gas is a
- * conservative budget: a 30-day plan runs 7 transactions (approve + deposit 2, weekly
- * actions 4, withdraw 1), so the gas deducted is 7 x the per-transaction figure. */
+ * conservative budget that follows the hold: 2 setup transactions, one weekly action per
+ * full week, 1 exit — 7 on a 30-day plan, 9 on 45 days, 11 on 60 — each priced on the
+ * chain it actually runs on. */
 export function farmNet(
   entry: SnapshotProtocol,
   valueIfLaunches: number,
@@ -1186,9 +1551,8 @@ export function farmNet(
   size: number,
   dropShare: number,
 ): number {
-  const gasPerTx = (entry.chains[0] ?? '') === 'Ethereum' ? FARM.gas_ethereum : FARM.gas_other;
-  const gas = FARM.gas_transactions * gasPerTx;
   const hold = holdDaysFor(age);
+  const gas = gasForPlan(entry, hold);
   const reward = entry.tvl_usd > 0 ? valueIfLaunches * dropShare * (size / entry.tvl_usd) : 0;
   return Math.round((reward - gas - (size * FARM.opportunity_rate * hold) / 365) * 100) / 100;
 }
@@ -1208,12 +1572,15 @@ export function farmVerdictFor(
   return 'Skip';
 }
 
-/** The board's protocols, strongest first, ranked 1..n. */
+/** The board's protocols, strongest first, ranked 1..n. The blend is the rolling-chosen
+ * log-space weight between the radar formula and the flat TVL multiple — alpha 0 is the
+ * flat fallback when no blend passes the rolling gate. */
 export function buildBoard(
   snapshot: Snapshot,
   model: ModelConstants = MODEL,
   propensity: PropensityModel,
   holdout: HoldoutSummary,
+  blend: { alpha: number; flatMultiple: number },
 ): BoardRow[] {
   const lookup = bySlug(snapshot.protocols);
   const picked = new Map<string, SnapshotProtocol>();
@@ -1259,14 +1626,16 @@ export function buildBoard(
     const med = median(values.sort((a, b) => a - b));
     if (med !== null) categoryMedian.set(key, med);
   }
-  const ctx: ModelContext = { anchorByCategory: anchors.byCategory, globalAnchor: anchors.global, categoryMedian };
+  const ctx: ModelContext = { anchorByCategory: anchors.byCategory, globalAnchor: anchors.global, categoryMedian, blendAlpha: blend.alpha, flatMultiple: blend.flatMultiple };
 
-  // Radar-6 scores each row as three separate numbers: the launch value is the primary USD
+  // Radar-7 scores each row as three separate numbers: the launch value is the primary USD
   // value and the board's ranking; the tokenization propensity is an auxiliary indicator,
   // never multiplied into a USD value; the risk-adjusted score is launch value times
-  // propensity, a unitless sort aid. The range is the holdout error distribution around
-  // the launch value, assuming a launch. The farm verdict is judged on each plan size
-  // independently, from the conditional nets under the drop-share scenarios.
+  // propensity, a unitless sort aid. The launch value blends the radar formula with the
+  // flat TVL multiple at the rolling-chosen alpha — alpha 0 is the flat fallback. The
+  // range is the holdout error distribution around the launch value, assuming a launch.
+  // The farm verdict is judged on each plan size independently, from the conditional nets
+  // under the drop-share scenarios.
   const scored = pickedRows.map((entry) => {
     const result = impliedValue(entry, snapshot.as_of, model, ctx);
     const propensityValue = propensityScore(entry, snapshot.as_of, propensity);
@@ -1334,7 +1703,7 @@ function secondChainOf(entry: SnapshotProtocol): string | null {
 }
 
 /**
- * How executable a protocol's farm plan is, from the snapshot alone. Verified: a large,
+ * How executable a protocol's farm plan is, from the snapshot alone. Category-supported: a large,
  * long-running protocol in a category with one canonical product — the category names the
  * product, and the size and age make it likely to exist, but it is not a live check of the
  * specific vault or pool. Conditional: the category names the kind but the protocol is not
@@ -1348,7 +1717,7 @@ export function planStateFor(entry: SnapshotProtocol, age: number | null): PlanS
   // a bare chain, whose apps are not named by the snapshot.
   const specific = ['uncollateralized', 'cdp', 'lend', 'collateral', 'interest rate', 'perpetual', 'derivative', 'basis', 'options', 'leveraged farm', 'dex', 'liquidity manager', 'yield aggregator', 'yield', 'curator', 'allocator', 'restak', 'staking', 'bridge', 'rwa', 'wrapper', 'stable', 'btc', 'prediction', 'insurance', 'launchpad', 'token locker', 'otc', 'cedefi', 'payment', 'governance', 'card', 'index', 'farm'];
   const named = specific.some((c) => kind.includes(c));
-  if (named && entry.tvl_usd >= 500_000_000 && age !== null && age >= 365) return 'Verified';
+  if (named && entry.tvl_usd >= 500_000_000 && age !== null && age >= 365) return 'Category-supported';
   if (named) return 'Conditional';
   return 'Research first';
 }
@@ -1499,9 +1868,10 @@ function exitActionFor(entry: SnapshotProtocol): string {
  * times the funding by the seven-day change, the weekly step alternates the chains the
  * protocol actually runs on, the hold step is sized by the protocol's own age and TVL,
  * and the last step is the exit rule, priced by the TVL the farmer entered at. The gas
- * budget is 7 transactions at the per-transaction figure — a conservative budget, not a
- * live quote. The plan state decides how direct the steps are: a Research first plan
- * starts with research and never writes an unverified step as an executable instruction.
+ * budget follows the hold — 2 setup, one weekly action per full week, 1 exit, each priced
+ * on its chain — a conservative budget, not a live quote. The plan state decides how
+ * direct the steps are: a Research first plan starts with research and never writes an
+ * unverified step as an executable instruction.
  * Nothing here promises a token or an airdrop: the plan farms the protocol as it stands.
  */
 export function farmSteps(
@@ -1513,15 +1883,15 @@ export function farmSteps(
   const firstChain = chainOf(entry);
   const secondChain = secondChainOf(entry);
   const stake = planSize;
-  const gasPerTx = firstChain === 'Ethereum' ? FARM.gas_ethereum : FARM.gas_other;
-  const gasTotal = FARM.gas_transactions * gasPerTx;
-  const gas = gasRange(entry);
   const holdDays = holdDaysFor(age);
+  const gasTotal = gasForPlan(entry, holdDays);
+  const nTx = gasTransactionsFor(holdDays);
+  const gas = gasRange(entry);
   const secondChainClause = secondChain === null ? '' : ' If you farm on both chains, alternate weeks between ' + firstChain + ' and ' + secondChain + '.';
   const youngClause = age !== null && age < 90 ? ' The protocol is only ' + age + ' days old, so check its announcements weekly too.' : '';
   const logSecond = secondChain === null ? '' : ' Note the second chain, ' + secondChain + ', if you farmed there too.';
-  const stateClause = state === 'Verified'
-    ? 'Plan state: Verified — ' + entry.name + ' is large and long-running in ' + (entry.category ?? 'its category') + ', a category with one canonical product; still check its own page before depositing.'
+  const stateClause = state === 'Category-supported'
+    ? 'Plan state: Category-supported — ' + entry.name + ' is large and long-running in ' + (entry.category ?? 'its category') + ', a category with one canonical product; the name means the category supports a product, not that the specific vault or pool was checked — still check its own page before depositing.'
     : state === 'Conditional'
       ? 'Plan state: Conditional — the steps below are category-inferred hypotheticals; deposit only if ' + entry.name + ' actually runs the product named.'
       : 'Plan state: Research first — the snapshot does not pin down a product for ' + entry.name + '; start by reading its own page and only fund it once you have named the product.';
@@ -1533,7 +1903,7 @@ export function farmSteps(
     : 'If ' + entry.name + ' runs a points program, do one qualifying action each week, such as ' + weeklyActionFor(entry) + ', so the week\'s activity counts toward it.' + secondChainClause + youngClause;
   const mk = (text: string, cost: string, time: string): FarmStep => ({ text, cost, time });
   const plan: FarmStep[] = [
-    mk('Set up a fresh wallet on ' + firstChain + ' with $' + stake + ' of USDC and a gas budget of roughly $' + gasTotal.toFixed(2) + ' (7 transactions at about $' + gasPerTx.toFixed(2) + ' each — a conservative budget, gas moves with the network), and keep its seed phrase offline. ' + growthNote(entry) + ' ' + stateClause, 'gas budget of roughly $' + gasTotal.toFixed(2) + ' (7 transactions, estimate)', '10 minutes'),
+    mk('Set up a fresh wallet on ' + firstChain + ' with $' + stake + ' of USDC and a gas budget of roughly $' + gasTotal.toFixed(2) + ' (' + nTx + ' transactions across the plan\'s chains — a conservative budget, gas moves with the network), and keep its seed phrase offline. ' + growthNote(entry) + ' ' + stateClause, 'gas budget of roughly $' + gasTotal.toFixed(2) + ' (' + nTx + ' transactions, estimate)', '10 minutes'),
     mk(actionStep, '$' + stake + ' of capital and gas of roughly ' + gas + ' (estimate)', '15 minutes to set up'),
     mk(weeklyStep, 'a few dollars of gas a week', '10 minutes a week'),
     mk('Hold the position for at least ' + holdDays + ' days so the activity is counted in more than one snapshot. ' + ageNote(age, holdDays) + ' TVL is ' + fmtTvl(entry.tvl_usd) + ', so your $' + stake + ' position is a small share of the pool.', 'the $' + stake + ' stays in the position', holdDays + ' days'),
@@ -1614,13 +1984,15 @@ function spearman(v2Rank: Map<string, number>, currentRank: Map<string, number>)
 }
 
 /**
- * The four ratios that carry a row from its radar-2 value to its radar-6 value: their product
- * is implied_v6 / implied_v2, within a dollar of rounding. Growth is the category-relative
- * tanh factor over the old clamped factor; compression is the sub-linear base over the old
- * linear one, including the calibrated scale k and the row's own unified anchor; age is the
- * old maturity factor dropped; chain is the 3% step over the old 4%. The tokenization
- * propensity is not a ratio here: radar-6 does not multiply it into the value, so it cannot
- * move a row against radar-2.
+ * The four ratios that carry a row's RADAR component from its radar-2 value: their product
+ * is the radar component's value over implied_v2, within a dollar of rounding. Growth is
+ * the category-relative tanh factor over the old clamped factor; compression is the
+ * sub-linear base over the old linear one, including the calibrated scale k and the row's
+ * own unified anchor; age is the old maturity factor dropped; chain is the 3% step over
+ * the old 4%. The board value blends that radar component toward the flat TVL multiple at
+ * the rolling-chosen alpha, so the product is the radar component's ratio, not the board
+ * value's. The tokenization propensity is not a ratio here: radar-7 does not multiply it
+ * into the value, so it cannot move a row against radar-2.
  */
 function changeRatios(
   row: BoardRow,
@@ -1668,7 +2040,7 @@ function moveReason(
     const clamped = Math.max(MODEL_V2.growth_floor, Math.min(MODEL_V2.growth_cap, change));
     const growthV2 = 1 + (clamped / 100) * MODEL_V2.growth_weight;
     if (movedUp) return 'Outgrew its category: seven-day change ' + fmtPct(change) + ' against a ' + (row.category ?? 'Other') + ' median of ' + fmtPct(catMedian) + ' (growth ' + row.model.growth_factor.toFixed(2) + 'x, where radar-2 paid ' + growthV2.toFixed(2) + 'x).';
-    if (growthV2 >= 1.5) return 'The seven-day spike radar-2 rewarded at ' + growthV2.toFixed(2) + 'x is capped at ' + row.model.growth_factor.toFixed(2) + 'x under radar-6: seven-day change ' + fmtPct(change) + ' against a ' + (row.category ?? 'Other') + ' median of ' + fmtPct(catMedian) + '.';
+    if (growthV2 >= 1.5) return 'The seven-day spike radar-2 rewarded at ' + growthV2.toFixed(2) + 'x is capped at ' + row.model.growth_factor.toFixed(2) + 'x under radar-7: seven-day change ' + fmtPct(change) + ' against a ' + (row.category ?? 'Other') + ' median of ' + fmtPct(catMedian) + '.';
     return 'Lagged its category: seven-day change ' + fmtPct(change) + ' against a ' + (row.category ?? 'Other') + ' median of ' + fmtPct(catMedian) + ' (growth ' + row.model.growth_factor.toFixed(2) + 'x, where radar-2 paid ' + growthV2.toFixed(2) + 'x).';
   }
   if (kind === 'compression') {
@@ -1682,7 +2054,7 @@ function moveReason(
   return 'Chain breadth: the chain step fell from 4% to 3%, so extra chains count for less than they did.';
 }
 
-/** The radar-2 versus radar-6 comparison: Spearman correlation and the biggest movers. */
+/** The radar-2 versus radar-7 comparison: Spearman correlation and the biggest movers. */
 function buildComparison(
   ranked: BoardRow[],
   v2RankBySlug: Map<string, number>,
@@ -1726,13 +2098,21 @@ export function buildRadar(
   // imply, so the board runs on 0.25 x k. The holdout numbers the dashboard prints come
   // from nested calibration — each test sample's own scale factor is taken from the others —
   // so the reported misses are honest, not re-priced with the scale they were calibrated
-  // with. The second pass, with the calibrated base in place, is the one reported.
+  // with. The second pass, with the calibrated base in place, is the one reported — and
+  // with the rolling-chosen blend weight, so the holdout numbers describe the model the
+  // board actually runs.
   const firstHoldout = holdoutValidation(snapshot, model);
   const scaleK = Math.exp(firstHoldout.log_p50_raw);
   const calibrated: ModelConstants = { ...model, base_multiple: model.base_multiple * scaleK };
-  const holdout = holdoutValidation(snapshot, calibrated);
+  // Strict rolling validation picks the blend weight on the first three blocks among the
+  // alphas that pass the gate; when none passes the board falls back to flat TVL.
+  const rolling = rollingValidation(snapshot);
+  const holdout = holdoutValidation(snapshot, calibrated, rolling.chosen_alpha);
   const accounting = accountingOf(snapshot);
-  const ranked = buildBoard(snapshot, calibrated, propensity, holdout);
+  const tradedAll = snapshot.protocols
+    .filter((entry) => entry.mcap_usd !== null && entry.mcap_usd > 0 && entry.tvl_usd > 0);
+  const flatMultiple = holdoutMedians(tradedAll).flatMultiple;
+  const ranked = buildBoard(snapshot, calibrated, propensity, holdout, { alpha: rolling.chosen_alpha, flatMultiple });
   const liveSet = liveRows(snapshot);
   const early = ranked.filter((r) => snapshot.watchlist.includes(r.slug) === false).length;
   // The radar-2 comparison: score the same rows with the old function and rank them the same
@@ -1777,8 +2157,6 @@ export function buildRadar(
   }
   const totalImplied = ranked.reduce((sum, row) => sum + row.implied_value_usd, 0);
   const meanPropensity = ranked.length === 0 ? 0 : Math.round((ranked.reduce((sum, row) => sum + row.propensity, 0) / ranked.length) * 10000) / 10000;
-  const tradedForAnchor = snapshot.protocols
-    .filter((entry) => entry.mcap_usd !== null && entry.mcap_usd > 0 && entry.tvl_usd > 0);
   const radarData: RadarData = {
     as_of: snapshot.as_of, source: snapshot.source, floor_usd: snapshot.floor_usd,
     model: calibrated, model_version: MODEL_VERSION,
@@ -1790,10 +2168,12 @@ export function buildRadar(
     }),
     live: liveSet,
     comparison,
-    propensity, age_ablation: ablation, holdout, accounting, verdict_counts: verdictCounts,
+    propensity, age_ablation: ablation, holdout,
+    blend_alpha: rolling.chosen_alpha, flat_multiple: flatMultiple, rolling,
+    accounting, verdict_counts: verdictCounts,
     total_implied_usd: totalImplied, mean_propensity: meanPropensity, base_rate: propensity.base_rate,
     scale_k: Math.round(scaleK * 10000) / 10000,
-    tvl_anchor_global: tvlAnchors(tradedForAnchor).global,
+    tvl_anchor_global: tvlAnchors(tradedAll).global,
   };
   return { board: ranked, radar: radarData };
 }
@@ -1863,7 +2243,7 @@ export function boardIssue(
     const expectedPriority = Math.round(row.value_if_launches_usd * row.propensity * 100) / 100;
     if (row.priority_score !== expectedPriority) return row.slug + ' has priority score ' + row.priority_score + ' but launch value times propensity is ' + expectedPriority;
     if (row.farm_plan_size !== 1000 && row.farm_plan_size !== 10000) return row.slug + ' has farm plan size ' + row.farm_plan_size;
-    if (row.plan_state !== 'Verified' && row.plan_state !== 'Conditional' && row.plan_state !== 'Research first') return row.slug + ' has plan state ' + row.plan_state;
+    if (row.plan_state !== 'Category-supported' && row.plan_state !== 'Conditional' && row.plan_state !== 'Research first') return row.slug + ' has plan state ' + row.plan_state;
     if (row.propensity <= 0 || row.propensity > 1) return row.slug + ' has propensity ' + row.propensity;
     if (row.range_lo_usd > row.implied_value_usd || row.implied_value_usd > row.range_hi_usd) return row.slug + ' has an implied value outside its printed range';
   }

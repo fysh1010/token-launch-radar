@@ -1,4 +1,4 @@
-// Token Radar's scoring model, release radar-4: a sealed snapshot goes in, a ranked board comes out.
+// Token Radar's scoring model, release radar-5: a sealed snapshot goes in, a ranked board comes out.
 //
 // Which protocols make the board. The board always carries every slug the snapshot's watchlist
 // names — that list is the floor, never the ceiling — and on top of it the early radar adds
@@ -19,33 +19,42 @@
 // WBTC, Binance staked ETH, Coinbase Bridge and USDT0 never show up on this board, however
 // large their TVL — they fail the visible test itself, not the watchlist.
 //
-// Implied value is value-if-it-launches times launch odds, both from the snapshot's own numbers:
+// Implied value is value-if-it-launches times tokenization propensity, both from the snapshot's
+// own numbers:
 //
-//   value-if-launches  = 0.25 x tvl_usd^0.85 x tvl_median^0.15 x growth x chains
+//   value-if-launches  = base x tvl_usd^0.85 x tvl_median^0.15 x growth x chains
 //                          (the radar-3 value formula, kept whole: tvl_median is the median TVL
 //                          across the board's own rows, growth is 1 + 0.25 x tanh((change_7d -
 //                          cat_median) / 25) against the category median, chains is
-//                          1 + 0.03 x min(max(chains - 1, 0), 5))
-//   launch odds        = sigmoid(w0 + w1 x z(log10 TVL) + w2 x z(log10(age + 30)) + w3 x z(chains)
-//                          + w4 x z(category launch rate)), a logistic model fitted on the 614
-//                          protocols whose outcome the snapshot knows — launched, or rankable
-//                          pre-token — with the protocol itself left out of its category rate and
-//                          the features standardised on the training set. The intercept is
-//                          calibrated so the mean predicted odds on the training set equals the
-//                          observed launch rate, and the fit is checked by five-fold
-//                          cross-validation. Age scores in the odds now, not in the value: a
-//                          protocol that has run three years with no token is not worth more, but
-//                          it is more likely to launch one than a young one.
-//   implied            = max(1, round(value-if-launches x launch odds))
+//                          1 + 0.03 x min(max(chains - 1, 0), 5)). The base is not the round 0.25
+//                          any more: it is 0.25 x k, where k = exp(median log(MCAP / predicted))
+//                          over the traded tokens' leave-one-out predictions — the value scale
+//                          the traded tokens themselves imply, not a round number and not a
+//                          competitor's total.
+//   tokenization propensity = sigmoid(w0 + w1 x z(log10 TVL) + w2 x z(log10(age + 30)) + w3 x z(chains)
+//                          + w4 x z(category rate)), a logistic score fitted on the eligible
+//                          protocols only — every protocol the board's own visible test keeps,
+//                          launched or not — with the protocol itself left out of its category
+//                          rate and the features standardised on the training set. It is a
+//                          cross-sectional score, not a probability that the protocol will launch
+//                          a token: the label is "has a token at snapshot time", the snapshot is
+//                          a single cross-section, and no future launch dates exist to calibrate
+//                          against. Age scores in the propensity now, not in the value: a protocol
+//                          that has run three years with no token is not worth more, but among the
+//                          eligible protocols the older ones more often have a token already.
+//   implied            = max(1, round(value-if-launches x tokenization propensity))
 //
 // The value formula is checked out of sample, not just fitted: leave-one-out over the traded
 // tokens (each priced from a fit on the others) and by-time (the older half fits the model that
 // prices the newer half), each against a flat TVL-multiple baseline. The printed range on every
 // row is the leave-one-out error distribution's P25-P75 (and P10-P90) around the implied value,
 // and the coverage those ranges achieve on the by-time held-out caps is measured and printed
-// alongside. No protocol name is ever special-cased, and no row is hand-picked: one function
-// scores every row, and the dashboard prints the formula alongside the constants it runs. The
-// previous release's formula is kept beside it as a comparison function only, never for the ranking.
+// alongside. The range is the value model's error assuming a launch; the propensity score is the
+// separate launch uncertainty, and the dashboard shows the two apart — the P10-P90 range is not
+// an 80% confidence interval on the final airdrop value. No protocol name is ever special-cased,
+// and no row is hand-picked: one function scores every row, and the dashboard prints the formula
+// alongside the constants it runs. The previous release's formula is kept beside it as a
+// comparison function only, never for the ranking.
 
 /** A snapshot protocol entry: the ten fields the sealed input carries, no more. */
 export interface SnapshotProtocol {
@@ -107,7 +116,7 @@ export const MODEL_V2: ModelConstantsV2 = { // radar-2, comparison only
 };
 
 /** The model release label, the one the dashboard shows. */
-export const MODEL_VERSION: string = 'radar-4';
+export const MODEL_VERSION: string = 'radar-5';
 
 /** Live-token rows in the dashboard's Live token view, by market cap. */
 export const LIVE_ROWS: number = 24;
@@ -119,44 +128,67 @@ export interface FarmStep {
   text: string; // the action itself
 }
 
-/** A farm verdict on the small plan's expected net: Farm clears the threshold, Marginal
- * clears zero, Skip loses money. The verdict is about the farmer's plan, not the protocol's
- * quality: a large protocol can top the board and still be a Skip on a small plan, because a
- * small position is a dust share of its drop. */
+/** A farm verdict on the small plan's expected net under the drop-share scenarios: Farm when
+ * even the conservative 1% drop clears the threshold, Marginal when the neutral 3% drop
+ * clears zero, Skip when the neutral drop loses money. The verdict is about the farmer's
+ * plan, not the protocol's quality: a large protocol can top the board and still be a Skip
+ * on a small plan, because a small position is a dust share of its drop. */
 export type FarmVerdict = 'Farm' | 'Marginal' | 'Skip';
 
-/** The launch-odds model's constants. */
-export interface OddsConstants {
+/** The tokenization-propensity score's constants. */
+export interface PropensityConstants {
   iterations: number; // gradient-descent steps, fixed so the fit is deterministic
   learning_rate: number; // step size for the batch gradient
   unknown_age_days: number; // age assumed when a protocol has no listing date
-  max_chains: number; // most chains that count in the odds
-  smoothing: number; // Laplace pseudocount on the category launch rate
-  calibration_tolerance: number; // how close the mean predicted odds must sit to the base rate
-  calibration_steps: number; // most intercept shifts the calibration tries
+  max_chains: number; // most chains that count in the score
+  smoothing: number; // Laplace pseudocount on the category rate
   cv_folds: number; // folds in the cross-validation
 }
 
-export const ODDS: OddsConstants = { // the constants the dashboard prints
+export const PROPENSITY: PropensityConstants = { // the constants the dashboard prints
   iterations: 3000, learning_rate: 0.5, unknown_age_days: 365,
-  max_chains: 6, smoothing: 2, calibration_tolerance: 1e-6,
-  calibration_steps: 50, cv_folds: 5,
+  max_chains: 6, smoothing: 2, cv_folds: 5,
 };
 
-/** The fitted launch-odds model: the weights in standardised feature space, the feature
- * means and standard deviations they are measured against, and the category counts the
- * leave-one-out category rate is built from. */
-export interface OddsModel {
+/** One predicted band's calibration: the predicted centre, how many held-out protocols fall
+ * in the band, and the share of them that already have a token. */
+export interface PropensityBand {
+  center: number; // predicted centre of the band: 0.1, 0.3, 0.5, 0.7 or 0.9
+  n: number; // held-out protocols in the band
+  actual: number; // share of them that already have a token
+}
+
+/** The time-split check: the older half of the training set fits the model that scores the
+ * newer half, so the numbers are out of sample in time as well as in fold. */
+export interface PropensityTimeSplit {
+  split: string; // the listing date the split falls on
+  n: number; // newer-half protocols scored
+  roc_auc: number; // area under the ROC curve on the newer half
+  brier: number; // mean squared error of the score against the label, newer half
+  log_loss: number; // mean log loss of the score against the label, newer half
+}
+
+/** The fitted tokenization-propensity score: the weights in standardised feature space, the
+ * feature means and standard deviations they are measured against, and the category counts the
+ * leave-one-out category rate is built from. It is a score, not a calibrated probability: the
+ * quality numbers below are discrimination and calibration on the cross-sectional label
+ * "has a token now", and no number here measures how often a protocol will launch one later. */
+export interface PropensityModel {
   weights: number[]; // intercept first, then one per feature, in standardised space
   means: number[]; // feature means over the training set
   sds: number[]; // feature standard deviations over the training set (population)
   cat_total: Record<string, number>; // protocols per category in the training set
   cat_launched: Record<string, number>; // launched protocols per category in the training set
-  base_rate: number; // launched share among the training set
+  base_rate: number; // launched share among the eligible training set
   train_size: number; // training protocols
   launched: number; // launched protocols in the training set
-  cv_accuracy: number; // five-fold cross-validated accuracy at a 0.5 threshold
-  cv_baseline: number; // majority-class accuracy on the same folds
+  roc_auc: number; // five-fold out-of-fold ROC-AUC of the score
+  brier: number; // five-fold out-of-fold Brier score
+  brier_baseline: number; // Brier score of always predicting the base rate
+  log_loss: number; // five-fold out-of-fold log loss
+  log_loss_baseline: number; // log loss of always predicting the base rate
+  calibration: PropensityBand[]; // actual launched share per predicted band, out of fold
+  time_split: PropensityTimeSplit; // the same quality numbers on the newer half, by listing date
 }
 
 /** What the holdout tests say about the value model: the median miss of the radar-3 value
@@ -194,10 +226,14 @@ export interface AccountingGroup {
   count: number; // protocols in it
 }
 
-/** The farm verdict's constants: the drop share, the two plan sizes, the gas a setup costs
- * on Ethereum and elsewhere, the annual cost of the capital, and the net threshold. */
+/** The farm verdict's constants: the three drop-share scenarios, the two plan sizes, the gas
+ * a setup costs on Ethereum and elsewhere, the annual cost of the capital, and the net
+ * threshold. No scenario is evidence: the shares are scenarios, and the verdicts are stated
+ * against them — Farm when even the conservative drop clears the threshold. */
 export interface FarmConstants {
-  drop_share: number; // share of the implied value the drop pays out
+  drop_share_conservative: number; // drop share in the conservative scenario
+  drop_share_neutral: number; // drop share in the neutral scenario
+  drop_share_optimistic: number; // drop share in the optimistic scenario
   plan_small: number; // small plan size, dollars
   plan_large: number; // large plan size, dollars
   gas_ethereum: number; // setup gas on Ethereum, dollars
@@ -207,7 +243,8 @@ export interface FarmConstants {
 }
 
 export const FARM: FarmConstants = { // the constants the dashboard prints
-  drop_share: 0.07, plan_small: 1000, plan_large: 10000,
+  drop_share_conservative: 0.01, drop_share_neutral: 0.03, drop_share_optimistic: 0.07,
+  plan_small: 1000, plan_large: 10000,
   gas_ethereum: 11.5, gas_other: 3, opportunity_rate: 0.05, farm_threshold: 10,
 };
 
@@ -226,16 +263,18 @@ export interface BoardRow {
   symbol: string | null; // token symbol, when one exists
   age_days: number | null; // days since listing, when known
   token_status: 'pre-token'; // always pre-token on the board
-  implied_value_usd: number; // value-if-it-launches times launch odds, the ranking value
-  value_if_launches_usd: number; // the radar-3 value formula, before the odds discount it
-  launch_odds: number; // fitted probability the protocol launches a token, 0..1
+  implied_value_usd: number; // value-if-it-launches times tokenization propensity, the ranking value
+  value_if_launches_usd: number; // the radar-3 value formula, before the propensity discount it
+  propensity: number; // tokenization propensity score, 0..1 — cross-sectional, not a launch probability
   range_lo_usd: number; // P25 end of the printed range, from the holdout error distribution
   range_hi_usd: number; // P75 end of the printed range
   range_lo10_usd: number; // P10 end of the printed range
   range_hi90_usd: number; // P90 end of the printed range
   farm_verdict: FarmVerdict; // Farm, Marginal or Skip on the small plan's expected net
-  net_1000_usd: number; // expected net of farming at the $1,000 plan size
-  net_10000_usd: number; // expected net of farming at the $10,000 plan size
+  net_1000_usd: number; // expected net of farming at the $1,000 plan size, neutral 3% drop
+  net_10000_usd: number; // expected net of farming at the $10,000 plan size, neutral 3% drop
+  net_1000_conservative_usd: number; // expected net at the $1,000 plan size, conservative 1% drop
+  net_1000_optimistic_usd: number; // expected net at the $1,000 plan size, optimistic 7% drop
   off_list: boolean; // true when the protocol is above the floor but the watchlist skips it
   model: { // the factors behind the value, each recomputable from the snapshot
     tvl_base: number; // 0.25 x TVL^0.85 x board-median TVL^0.15, in dollars
@@ -260,15 +299,17 @@ export interface RadarRow {
   listed_at: string | null; // listing date
   age_days: number | null; // days since listing, when known
   implied_value_usd: number; // the model's implied value
-  value_if_launches_usd: number; // the radar-3 value formula, before the odds discount it
-  launch_odds: number; // fitted probability the protocol launches a token, 0..1
+  value_if_launches_usd: number; // the radar-3 value formula, before the propensity discount it
+  propensity: number; // tokenization propensity score, 0..1 — cross-sectional, not a launch probability
   range_lo_usd: number; // P25 end of the printed range, from the holdout error distribution
   range_hi_usd: number; // P75 end of the printed range
   range_lo10_usd: number; // P10 end of the printed range
   range_hi90_usd: number; // P90 end of the printed range
   farm_verdict: FarmVerdict; // Farm, Marginal or Skip on the small plan's expected net
-  net_1000_usd: number; // expected net of farming at the $1,000 plan size
-  net_10000_usd: number; // expected net of farming at the $10,000 plan size
+  net_1000_usd: number; // expected net of farming at the $1,000 plan size, neutral 3% drop
+  net_10000_usd: number; // expected net of farming at the $10,000 plan size, neutral 3% drop
+  net_1000_conservative_usd: number; // expected net at the $1,000 plan size, conservative 1% drop
+  net_1000_optimistic_usd: number; // expected net at the $1,000 plan size, optimistic 7% drop
   off_list: boolean; // true when the protocol is above the floor but the watchlist skips it
   growth_factor: number; // category-relative growth factor
   chain_factor: number; // chain-breadth factor
@@ -322,14 +363,15 @@ export interface RadarData {
   live_size: number; // live-token row count
   live: LiveRow[]; // live-token protocols, by market cap
   rows: RadarRow[]; // ranked rows, compact form
-  comparison: ModelComparison; // radar-2 versus radar-4, computed by the build
-  odds: OddsModel; // the fitted launch-odds model, so the page recomputes every row's odds
+  comparison: ModelComparison; // radar-2 versus radar-5, computed by the build
+  propensity: PropensityModel; // the fitted tokenization-propensity score, so the page recomputes every row's score
   holdout: HoldoutSummary; // what the out-of-sample holdout tests say about the value model
   accounting: AccountingGroup[]; // all snapshot protocols, grouped by outcome or reason
   verdict_counts: { farm: number; marginal: number; skip: number }; // farm verdicts on the board
   total_implied_usd: number; // sum of implied value across the board
-  mean_odds: number; // mean launch odds across the board
-  base_rate: number; // observed launch rate among protocols with known outcomes
+  mean_propensity: number; // mean tokenization propensity across the board
+  base_rate: number; // observed launched share among the eligible training set — a statistic, not a calibration target
+  scale_k: number; // the leave-one-out median log ratio that sets the value base: base = 0.25 x k
 }
 
 /** Raised when a snapshot is not one this model can score. */
@@ -370,8 +412,8 @@ export interface ModelContext {
 }
 
 /** One protocol's factors and value-if-it-launches under the radar-3 formula, the value half
- * of radar-4: the same sub-linear TVL base, category-relative growth and chain factor, with
- * the launch odds applied later, in buildBoard. */
+ * of radar-5: the same sub-linear TVL base, category-relative growth and chain factor, with
+ * the tokenization propensity applied later, in buildBoard. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
@@ -478,10 +520,10 @@ function sigmoid(z: number): number {
 }
 
 /**
- * One protocol's category launch rate, with the protocol itself left out and Laplace smoothing
+ * One protocol's category rate, with the protocol itself left out and Laplace smoothing
  * toward one half: a category with few members leans on the prior, a large one on its own
  * record. `selfY` is the protocol's own outcome when it is one of the counted protocols
- * (1 launched, 0 rankable pre-token), or null when it was never counted.
+ * (1 already has a token, 0 records none), or null when it was never counted.
  */
 function categoryRate(
   entry: SnapshotProtocol,
@@ -493,15 +535,15 @@ function categoryRate(
   const total = (catTotal.get(category) ?? 0) - (selfY === null ? 0 : 1);
   const launched = (catLaunched.get(category) ?? 0) - (selfY === null ? 0 : selfY);
   if (total <= 0) return 0.5;
-  return (launched + ODDS.smoothing / 2) / (total + ODDS.smoothing);
+  return (launched + PROPENSITY.smoothing / 2) / (total + PROPENSITY.smoothing);
 }
 
 /**
- * One protocol's four odds features, from the snapshot's own fields: log10 TVL, log10 age
+ * One protocol's four propensity features, from the snapshot's own fields: log10 TVL, log10 age
  * (an unknown age scores as one year, then 30 days are added so a newborn protocol still
- * has a log), chain count capped at six, and the leave-one-out category launch rate.
+ * has a log), chain count capped at six, and the leave-one-out category rate.
  */
-function oddsFeatures(
+function propensityFeatures(
   entry: SnapshotProtocol,
   asOf: string,
   catTotal: Map<string, number>,
@@ -509,11 +551,11 @@ function oddsFeatures(
   selfY: number | null,
 ): number[] {
   const age = ageDays(asOf, entry.listed_at);
-  const logAge = Math.log10((age === null ? ODDS.unknown_age_days : age) + 30);
+  const logAge = Math.log10((age === null ? PROPENSITY.unknown_age_days : age) + 30);
   return [
     Math.log10(Math.max(entry.tvl_usd, 1)),
     logAge,
-    Math.min(entry.chains.length, ODDS.max_chains),
+    Math.min(entry.chains.length, PROPENSITY.max_chains),
     categoryRate(entry, catTotal, catLaunched, selfY),
   ];
 }
@@ -521,9 +563,9 @@ function oddsFeatures(
 /**
  * Batch gradient descent on the logistic loss, a fixed number of steps at a fixed rate, so
  * the fit is deterministic: the same snapshot always yields the same weights. The features
- * are standardised on the training set first, and the intercept is then shifted until the
- * mean predicted odds on the training set matches the observed launch rate — gradient
- * descent already lands within a hair of it, so this is a guard, not a second fit.
+ * are standardised on the training set first. No intercept calibration follows: the score is
+ * not presented as a calibrated probability, so shifting the intercept to match a base rate
+ * would claim a calibration this single snapshot cannot support.
  */
 function fitLogistic(
   features: number[][],
@@ -549,7 +591,7 @@ function fitLogistic(
   }
   const x: number[][] = features.map((row) => [1, ...row.map((v, d) => (v - means[d]!) / sds[d]!)]);
   const weights = new Array<number>(dim + 1).fill(0);
-  for (let step = 0; step < ODDS.iterations; step++) {
+  for (let step = 0; step < PROPENSITY.iterations; step++) {
     const grad = new Array<number>(dim + 1).fill(0);
     for (let i = 0; i < n; i++) {
       const xi = x[i]!;
@@ -558,36 +600,91 @@ function fitLogistic(
       const err = sigmoid(z) - y[i]!;
       for (let d = 0; d <= dim; d++) grad[d]! += err * xi[d]!;
     }
-    for (let d = 0; d <= dim; d++) weights[d]! -= (ODDS.learning_rate / n) * grad[d]!;
-  }
-  const target = y.reduce((a, b) => a + b, 0) / n;
-  for (let shift = 0; shift < ODDS.calibration_steps; shift++) {
-    let mean = 0;
-    for (let i = 0; i < n; i++) {
-      const xi = x[i]!;
-      let z = 0;
-      for (let d = 0; d <= dim; d++) z += weights[d]! * xi[d]!;
-      mean += sigmoid(z);
-    }
-    mean /= n;
-    if (Math.abs(mean - target) <= ODDS.calibration_tolerance) break;
-    const clamped = Math.max(1e-9, Math.min(1 - 1e-9, mean));
-    weights[0]! += Math.log(target / (1 - target)) - Math.log(clamped / (1 - clamped));
+    for (let d = 0; d <= dim; d++) weights[d]! -= (PROPENSITY.learning_rate / n) * grad[d]!;
   }
   return { weights, means, sds };
 }
 
+/** ROC-AUC from out-of-fold scores: the probability a launched protocol scores above a
+ * rankable one, with tied scores sharing the average rank. 0.5 is no discrimination. */
+function rocAuc(pairs: Array<{ p: number; y: number }>): number {
+  const positives = pairs.filter((pair) => pair.y === 1).length;
+  const negatives = pairs.length - positives;
+  if (positives === 0 || negatives === 0) return 0.5;
+  const ordered = [...pairs].sort((a, b) => a.p - b.p || a.y - b.y);
+  let rankSum = 0;
+  let i = 0;
+  while (i < ordered.length) {
+    let j = i;
+    while (j + 1 < ordered.length && ordered[j + 1]!.p === ordered[i]!.p) j++;
+    const averageRank = (i + 1 + j + 1) / 2;
+    for (let k = i; k <= j; k++) if (ordered[k]!.y === 1) rankSum += averageRank;
+    i = j + 1;
+  }
+  return Math.round(((rankSum - (positives * (positives + 1)) / 2) / (positives * negatives)) * 10000) / 10000;
+}
+
+/** Brier score: the mean squared error of the score against the label. Lower is better. */
+function brierScore(pairs: Array<{ p: number; y: number }>): number {
+  if (pairs.length === 0) return 0;
+  const total = pairs.reduce((sum, pair) => sum + (pair.p - pair.y) * (pair.p - pair.y), 0);
+  return Math.round((total / pairs.length) * 10000) / 10000;
+}
+
+/** Log loss: the mean negative log likelihood of the label under the score, the score
+ * clipped away from 0 and 1. Lower is better. */
+function logLoss(pairs: Array<{ p: number; y: number }>): number {
+  if (pairs.length === 0) return 0;
+  let total = 0;
+  for (const pair of pairs) {
+    const p = Math.max(1e-9, Math.min(1 - 1e-9, pair.p));
+    total += pair.y === 1 ? -Math.log(p) : -Math.log(1 - p);
+  }
+  return Math.round((total / pairs.length) * 10000) / 10000;
+}
+
+/** Calibration by predicted band: the five bands centred on 10%, 30%, 50%, 70% and 90%,
+ * each with its count and the actual launched share inside it. */
+function calibrationBands(pairs: Array<{ p: number; y: number }>): PropensityBand[] {
+  const centres = [0.1, 0.3, 0.5, 0.7, 0.9];
+  return centres.map((center) => {
+    const inBand = pairs.filter((pair) => pair.p >= center - 0.1 && (center === 0.9 ? pair.p <= 1 : pair.p < center + 0.1));
+    const actual = inBand.length === 0 ? 0 : Math.round((inBand.reduce((sum, pair) => sum + pair.y, 0) / inBand.length) * 10000) / 10000;
+    return { center, n: inBand.length, actual };
+  });
+}
+
+/** One score from a fitted model: the protocol's four features, standardised against the
+ * training set, through the logistic weights. */
+function scoreWith(
+  entry: SnapshotProtocol,
+  asOf: string,
+  fit: { weights: number[]; means: number[]; sds: number[] },
+  catTotal: Map<string, number>,
+  catLaunched: Map<string, number>,
+  selfY: number | null,
+): number {
+  const features = propensityFeatures(entry, asOf, catTotal, catLaunched, selfY);
+  let z = fit.weights[0]!;
+  for (let d = 0; d < features.length; d++) {
+    z += fit.weights[d + 1]! * ((features[d]! - fit.means[d]!) / fit.sds[d]!);
+  }
+  return sigmoid(z);
+}
+
 /**
- * The launch-odds model, fitted on every protocol whose outcome the snapshot knows:
- * launched (a token trades) or rankable pre-token (no token, clears the visible test).
- * Sorted by slug so the fit order, and therefore every floating-point sum, is fixed. The
- * fit is checked by five-fold cross-validation: each fold's model is fitted on the other
- * four folds, with its own category counts and standardisation, and scored on the held-out
- * fold, so the reported accuracy is out of sample.
+ * The tokenization-propensity score, fitted on the eligible protocols only: every protocol
+ * the board's own visible test keeps, whether it already has a token or records none.
+ * Positives and negatives pass the same filter, so a bridge or a liquid-staking product can
+ * no longer enter as a positive while a pre-token protocol of the same kind is kept out of
+ * the negatives. Sorted by slug so the fit order, and therefore every floating-point sum,
+ * is fixed. Quality is measured out of fold — ROC-AUC, Brier score and log loss on the
+ * held-out fold, with calibration by predicted band — and again on a time split, the older
+ * half fitting the model that scores the newer half by listing date.
  */
-export function fitOddsModel(snapshot: Snapshot): OddsModel {
+export function fitPropensityModel(snapshot: Snapshot): PropensityModel {
   const train = snapshot.protocols
-    .filter((entry) => isPreToken(entry) === false || isRankable(entry))
+    .filter((entry) => passesVisibleRule(entry))
     .sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
   const y = train.map((entry) => (isPreToken(entry) ? 0 : 1));
   const catTotal = new Map<string, number>();
@@ -597,11 +694,12 @@ export function fitOddsModel(snapshot: Snapshot): OddsModel {
     catTotal.set(key, (catTotal.get(key) ?? 0) + 1);
     catLaunched.set(key, (catLaunched.get(key) ?? 0) + y[i]!);
   }
-  const features = train.map((entry, i) => oddsFeatures(entry, snapshot.as_of, catTotal, catLaunched, y[i]!));
+  const features = train.map((entry, i) => propensityFeatures(entry, snapshot.as_of, catTotal, catLaunched, y[i]!));
   const fitted = fitLogistic(features, y);
-  let correct = 0;
-  let baselineCorrect = 0;
-  const folds = ODDS.cv_folds;
+  // Out-of-fold scores: each fold's model is fitted on the other folds, with its own
+  // category counts and standardisation, and scores the held-out fold.
+  const oof: Array<{ p: number; y: number }> = [];
+  const folds = PROPENSITY.cv_folds;
   for (let fold = 0; fold < folds; fold++) {
     const testIdx: number[] = [];
     const trainIdx: number[] = [];
@@ -613,45 +711,81 @@ export function fitOddsModel(snapshot: Snapshot): OddsModel {
       foldTotal.set(key, (foldTotal.get(key) ?? 0) + 1);
       foldLaunched.set(key, (foldLaunched.get(key) ?? 0) + y[i]!);
     }
-    const foldFeatures = trainIdx.map((i) => oddsFeatures(train[i]!, snapshot.as_of, foldTotal, foldLaunched, y[i]!));
+    const foldFeatures = trainIdx.map((i) => propensityFeatures(train[i]!, snapshot.as_of, foldTotal, foldLaunched, y[i]!));
     const foldY = trainIdx.map((i) => y[i]!);
     const foldFit = fitLogistic(foldFeatures, foldY);
-    const majority = foldY.reduce((a, b) => a + b, 0) / foldY.length >= 0.5 ? 1 : 0;
     for (const i of testIdx) {
-      const f = oddsFeatures(train[i]!, snapshot.as_of, foldTotal, foldLaunched, null);
-      let z = foldFit.weights[0]!;
-      for (let d = 0; d < f.length; d++) z += foldFit.weights[d + 1]! * ((f[d]! - foldFit.means[d]!) / foldFit.sds[d]!);
-      if ((sigmoid(z) >= 0.5 ? 1 : 0) === y[i]!) correct++;
-      if (majority === y[i]!) baselineCorrect++;
+      oof.push({ p: scoreWith(train[i]!, snapshot.as_of, foldFit, foldTotal, foldLaunched, null), y: y[i]! });
     }
   }
+  // Time split: the older half by listing date fits the model that scores the newer half.
+  // Protocols with no listing date sit out of this check; the split date is the first
+  // listing date of the newer half.
+  const dated = train
+    .map((entry, i) => ({ entry, i }))
+    .filter(({ entry }) => entry.listed_at !== null)
+    .sort((a, b) => (a.entry.listed_at! < b.entry.listed_at! ? -1 : a.entry.listed_at! > b.entry.listed_at! ? 1 : a.entry.slug < b.entry.slug ? -1 : a.entry.slug > b.entry.slug ? 1 : 0));
+  let timeSplit: PropensityTimeSplit = { split: '', n: 0, roc_auc: 0, brier: 0, log_loss: 0 };
+  if (dated.length >= 4) {
+    const half = Math.floor(dated.length / 2);
+    const older = dated.slice(0, half);
+    const newer = dated.slice(half);
+    const olderTotal = new Map<string, number>();
+    const olderLaunched = new Map<string, number>();
+    for (const { entry, i } of older) {
+      const key = entry.category ?? 'Other';
+      olderTotal.set(key, (olderTotal.get(key) ?? 0) + 1);
+      olderLaunched.set(key, (olderLaunched.get(key) ?? 0) + y[i]!);
+    }
+    const olderFeatures = older.map(({ entry, i }) => propensityFeatures(entry, snapshot.as_of, olderTotal, olderLaunched, y[i]!));
+    const olderY = older.map(({ i }) => y[i]!);
+    const olderFit = fitLogistic(olderFeatures, olderY);
+    const newerPairs = newer.map(({ entry, i }) => ({
+      p: scoreWith(entry, snapshot.as_of, olderFit, olderTotal, olderLaunched, null),
+      y: y[i]!,
+    }));
+    timeSplit = {
+      split: newer[0]!.entry.listed_at!,
+      n: newer.length,
+      roc_auc: rocAuc(newerPairs),
+      brier: brierScore(newerPairs),
+      log_loss: logLoss(newerPairs),
+    };
+  }
   const launched = y.reduce((a, b) => a + b, 0);
+  const baseRate = launched / train.length;
+  const basePairs = y.map((label) => ({ p: baseRate, y: label }));
   return {
     weights: fitted.weights, means: fitted.means, sds: fitted.sds,
     cat_total: Object.fromEntries(catTotal), cat_launched: Object.fromEntries(catLaunched),
-    base_rate: Math.round((launched / train.length) * 10000) / 10000,
+    base_rate: Math.round(baseRate * 10000) / 10000,
     train_size: train.length, launched,
-    cv_accuracy: Math.round((correct / train.length) * 10000) / 10000,
-    cv_baseline: Math.round((baselineCorrect / train.length) * 10000) / 10000,
+    roc_auc: rocAuc(oof),
+    brier: brierScore(oof),
+    brier_baseline: brierScore(basePairs),
+    log_loss: logLoss(oof),
+    log_loss_baseline: logLoss(basePairs),
+    calibration: calibrationBands(oof),
+    time_split: timeSplit,
   };
 }
 
-/** One protocol's launch odds under the fitted model: its four features, standardised
- * against the training set, through the logistic weights. Board rows are in the training
- * set as rankable pre-token, so their own outcome is left out of the category rate. */
-export function launchOdds(
+/** One protocol's tokenization propensity under the fitted score: its four features,
+ * standardised against the training set, through the logistic weights. Board rows are in
+ * the training set as rankable pre-token, so their own outcome is left out of the category
+ * rate. */
+export function propensityScore(
   entry: SnapshotProtocol,
   asOf: string,
-  model: OddsModel,
+  model: PropensityModel,
 ): number {
   const catTotal = new Map(Object.entries(model.cat_total));
   const catLaunched = new Map(Object.entries(model.cat_launched));
-  const features = oddsFeatures(entry, asOf, catTotal, catLaunched, isPreToken(entry) ? 0 : 1);
-  let z = model.weights[0]!;
-  for (let d = 0; d < features.length; d++) {
-    z += model.weights[d + 1]! * ((features[d]! - model.means[d]!) / model.sds[d]!);
-  }
-  return sigmoid(z);
+  return scoreWith(
+    entry, asOf,
+    { weights: model.weights, means: model.means, sds: model.sds },
+    catTotal, catLaunched, isPreToken(entry) ? 0 : 1,
+  );
 }
 
 /** A quantile of a sorted list, by linear interpolation between the two nearest values. */
@@ -831,28 +965,30 @@ export function accountingOf(snapshot: Snapshot): AccountingGroup[] {
   return groups.map(([key, label]) => ({ key, label, count: counts.get(key) ?? 0 }));
 }
 
-/** The expected net of farming one protocol at one plan size: the drop share of the implied
- * value, allocated in proportion to the plan's share of TVL, less the setup gas and the
- * opportunity cost of the capital over the hold. The drop is modelled as split by capital
- * share of TVL — a simplification, stated as one in the dashboard, since real drops pay on
- * points and activity rather than TVL share. */
+/** The expected net of farming one protocol at one plan size under one drop-share scenario:
+ * the drop share of the implied value, allocated in proportion to the plan's share of TVL,
+ * less the setup gas and the opportunity cost of the capital over the hold. The drop is
+ * modelled as split by capital share of TVL — a simplification, stated as one in the
+ * dashboard, since real drops pay on points and activity rather than TVL share. */
 export function farmNet(
   entry: SnapshotProtocol,
   implied: number,
   age: number | null,
   size: number,
+  dropShare: number,
 ): number {
   const gas = (entry.chains[0] ?? '') === 'Ethereum' ? FARM.gas_ethereum : FARM.gas_other;
   const hold = holdDaysFor(age);
-  const reward = entry.tvl_usd > 0 ? implied * FARM.drop_share * (size / entry.tvl_usd) : 0;
+  const reward = entry.tvl_usd > 0 ? implied * dropShare * (size / entry.tvl_usd) : 0;
   return Math.round((reward - gas - (size * FARM.opportunity_rate * hold) / 365) * 100) / 100;
 }
 
-/** The farm verdict from the small plan's expected net: Farm clears the threshold, Marginal
- * clears zero, Skip loses money. */
-export function farmVerdictFor(netSmall: number): FarmVerdict {
-  if (netSmall > FARM.farm_threshold) return 'Farm';
-  if (netSmall > 0) return 'Marginal';
+/** The farm verdict from the small plan's expected net under two scenarios: Farm when even
+ * the conservative 1% drop clears the threshold, Marginal when the neutral 3% drop clears
+ * zero, Skip when the neutral drop loses money. */
+export function farmVerdictFor(netConservative: number, netNeutral: number): FarmVerdict {
+  if (netConservative > FARM.farm_threshold) return 'Farm';
+  if (netNeutral > 0) return 'Marginal';
   return 'Skip';
 }
 
@@ -860,7 +996,7 @@ export function farmVerdictFor(netSmall: number): FarmVerdict {
 export function buildBoard(
   snapshot: Snapshot,
   model: ModelConstants = MODEL,
-  odds: OddsModel,
+  propensity: PropensityModel,
   holdout: HoldoutSummary,
 ): BoardRow[] {
   const lookup = bySlug(snapshot.protocols);
@@ -906,20 +1042,23 @@ export function buildBoard(
   }
   const ctx: ModelContext = { tvlMedian, categoryMedian };
 
-  // Radar-4 scores each row as value-if-it-launches times launch odds: the radar-3 value
-  // formula, unrounded, discounted by the fitted odds. The range is the holdout error
-  // distribution around the implied value; the verdict is the small plan's expected net.
+  // Radar-5 scores each row as value-if-it-launches times tokenization propensity: the radar-3
+  // value formula, unrounded, discounted by the fitted score. The range is the holdout error
+  // distribution around the implied value; the verdict is the small plan's expected net under
+  // the three drop-share scenarios.
   const scored = pickedRows.map((entry) => {
     const result = impliedValue(entry, snapshot.as_of, model, ctx);
-    const oddsValue = launchOdds(entry, snapshot.as_of, odds);
+    const propensityValue = propensityScore(entry, snapshot.as_of, propensity);
     const valueIfLaunches = Math.max(1, result.tvlBase * result.growthFactor * result.chainFactor);
-    const implied = Math.max(1, Math.round(valueIfLaunches * oddsValue));
-    return { entry, ...result, oddsValue, valueIfLaunches, implied };
+    const implied = Math.max(1, Math.round(valueIfLaunches * propensityValue));
+    return { entry, ...result, propensityValue, valueIfLaunches, implied };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.entry.slug < b.entry.slug ? -1 : a.entry.slug > b.entry.slug ? 1 : 0));
   return scored.map((item, i) => {
-    const netSmall = farmNet(item.entry, item.implied, item.age, FARM.plan_small);
-    const netLarge = farmNet(item.entry, item.implied, item.age, FARM.plan_large);
+    const netSmallConservative = farmNet(item.entry, item.implied, item.age, FARM.plan_small, FARM.drop_share_conservative);
+    const netSmall = farmNet(item.entry, item.implied, item.age, FARM.plan_small, FARM.drop_share_neutral);
+    const netSmallOptimistic = farmNet(item.entry, item.implied, item.age, FARM.plan_small, FARM.drop_share_optimistic);
+    const netLarge = farmNet(item.entry, item.implied, item.age, FARM.plan_large, FARM.drop_share_neutral);
     return {
       rank: i + 1, slug: item.entry.slug, name: item.entry.name,
       category: item.entry.category, chains: item.entry.chains, tvl_usd: item.entry.tvl_usd,
@@ -927,13 +1066,14 @@ export function buildBoard(
       listed_at: item.entry.listed_at, gecko_id: item.entry.gecko_id, symbol: item.entry.symbol,
       token_status: 'pre-token', age_days: item.age, implied_value_usd: item.implied,
       value_if_launches_usd: item.valueIfLaunches,
-      launch_odds: item.oddsValue,
+      propensity: item.propensityValue,
       range_lo_usd: Math.max(1, Math.round(item.implied * holdout.range_lo_factor)),
       range_hi_usd: Math.max(1, Math.round(item.implied * holdout.range_hi_factor)),
       range_lo10_usd: Math.max(1, Math.round(item.implied * holdout.range_lo10_factor)),
       range_hi90_usd: Math.max(1, Math.round(item.implied * holdout.range_hi90_factor)),
-      farm_verdict: farmVerdictFor(netSmall),
+      farm_verdict: farmVerdictFor(netSmallConservative, netSmall),
       net_1000_usd: netSmall, net_10000_usd: netLarge,
+      net_1000_conservative_usd: netSmallConservative, net_1000_optimistic_usd: netSmallOptimistic,
       off_list: offList.has(item.entry.slug),
       model: {
         tvl_base: round2(item.tvlBase), growth_factor: round4(item.growthFactor),
@@ -1027,45 +1167,48 @@ function ageNote(ageInDays: number | null, hold: number): string {
  * snapshot's own field, and the action is derived the same way for every protocol of that kind.
  * Each branch names the asset, the venue and the chain, and adds the mechanic that makes the
  * kind different: the borrow for a lender, the hedge for a perp, the receipt for a staker.
- * Never a token name, never a promised airdrop: the plan farms the protocol as it stands.
+ * Every branch is conditional on the protocol running that product: the category names the
+ * kind, never the product — a vault, a pool or a farm is only farmed when the protocol's own
+ * page shows it. Never a token name, never a promised airdrop: the plan farms the protocol
+ * as it stands.
  */
 function actionFor(entry: SnapshotProtocol, capital: number, chain: string): string {
   const kind = (entry.category ?? '').toLowerCase();
   const label = entry.name;
-  if (kind.includes('uncollateralized')) return 'Lend $' + capital + ' of USDC through ' + label + ' on ' + chain + ' to its borrower pool and keep the loan receipts.';
-  if (kind.includes('cdp')) return 'Lock $' + capital + ' of USDC as collateral in ' + label + ' on ' + chain + ', mint the stablecoin it issues against it, and keep the collateral ratio above the liquidation line.';
-  if (kind.includes('lend') || kind.includes('collateral')) return 'Supply $' + capital + ' of USDC to ' + label + ' on ' + chain + ', borrow a small amount against it, and keep the health factor above the liquidation line.';
-  if (kind.includes('interest rate')) return 'Deposit $' + capital + ' of USDC as margin for one interest-rate position on ' + label + ' on ' + chain + ', and close it before the rate leg moves against you.';
-  if (kind.includes('perpetual') || kind.includes('derivative')) return 'Deposit $' + capital + ' of USDC as margin on ' + label + ' on ' + chain + ', open one small hedged position, and set a stop so it closes before liquidation.';
-  if (kind.includes('basis')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s basis vault on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and hold the delta-neutral position while funding stays positive.';
-  if (kind.includes('options')) return 'Deposit $' + capital + ' of USDC into an options vault on ' + label + ' on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and hold the vault shares through one expiry.';
-  if (kind.includes('leveraged farm')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s leveraged farm on ' + chain + ' (confirm the farm exists on the protocol\'s own page first) at the lowest leverage it offers, and watch the borrow rate daily.';
-  if (kind.includes('dex')) return 'Provide $' + capital + ' of liquidity to ' + label + '\'s main pool on ' + chain + ' (confirm the pool exists on the protocol\'s own page first), keeping the position in range, and collect the trading fees.';
-  if (kind.includes('liquidity manager')) return 'Deposit $' + capital + ' of USDC into a ' + label + ' managed vault on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and let the manager rebalance the range; keep the shares.';
-  if (kind.includes('yield aggregator')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s main vault on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and keep the shares while the strategy runs.';
-  if (kind.includes('yield')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s yield vault on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and keep the shares while the yield runs.';
-  if (kind.includes('curator')) return 'Deposit $' + capital + ' of USDC into a ' + label + ' curated vault on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and keep the vault shares; the curator picks the underlying markets, not you.';
-  if (kind.includes('allocator')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s allocator vault on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and let it rotate the funds between strategies.';
-  if (kind.includes('restak')) return 'Restake $' + capital + ' of the receipt token through ' + label + ' on ' + chain + ' and keep the restaking receipt.';
-  if (kind.includes('staking')) return 'Stake $' + capital + ' of the chain\'s staking asset through ' + label + ' on ' + chain + ' and keep the receipt token.';
-  if (kind.includes('bridge')) return 'Bridge $' + capital + ' of USDC to ' + chain + ' through ' + label + ' and use the bridged funds in its app the same week.';
-  if (kind.includes('chain')) return 'Bridge $' + capital + ' of USDC to ' + label + ' and use two of its native apps in the same week, starting with the largest one you can find on its own page.';
-  if (kind.includes('rwa')) return 'Mint $' + capital + ' of the yield-bearing asset through ' + label + ' on ' + chain + ' and hold it; read the backing report on the protocol\'s own page first.';
-  if (kind.includes('wrapper')) return 'Wrap $' + capital + ' of USDC into the wrapped stable through ' + label + ' on ' + chain + ' and hold the wrapped tokens.';
-  if (kind.includes('stable')) return 'Mint or deposit $' + capital + ' of the stable asset through ' + label + ' on ' + chain + ' and hold it through one peg check a week.';
-  if (kind.includes('btc')) return 'Deposit $' + capital + ' of BTC through ' + label + ' on ' + chain + ' and keep the receipt token until the hold ends.';
-  if (kind.includes('prediction')) return 'Fund $' + capital + ' and place one market position on ' + label + ' on ' + chain + ', then settle it when the market resolves.';
-  if (kind.includes('insurance')) return 'Buy $' + capital + ' of cover from ' + label + ' on ' + chain + ' and keep the policy open through the hold.';
-  if (kind.includes('launchpad')) return 'Join one ' + label + ' launch with $' + capital + ' on ' + chain + ' and hold the allocation through the lock-up.';
-  if (kind.includes('token locker')) return 'Lock $' + capital + ' of an asset in ' + label + ' on ' + chain + ' for the shortest term it offers.';
-  if (kind.includes('otc')) return 'Place one OTC trade of $' + capital + ' through ' + label + ' on ' + chain + ' and keep the trade receipt.';
-  if (kind.includes('cedefi')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s CeDeFi vault on ' + chain + ' (confirm the vault exists on the protocol\'s own page first) and keep the position open; the vault runs off-chain strategies.';
-  if (kind.includes('payment')) return 'Pay or receive $' + capital + ' through ' + label + ' on ' + chain + ' and keep the payment receipt.';
-  if (kind.includes('governance')) return 'Lock $' + capital + ' of the governance asset through ' + label + ' on ' + chain + ' and cast one vote in its next proposal.';
-  if (kind.includes('card')) return 'Spend $' + capital + ' through a ' + label + ' card on ' + chain + ' and keep the statement for the farm log.';
-  if (kind.includes('index')) return 'Buy $' + capital + ' of the ' + label + ' index on ' + chain + ' and hold the shares through one rebalance.';
-  if (kind.includes('farm')) return 'Deposit $' + capital + ' of USDC into ' + label + '\'s farm on ' + chain + ' and keep the position open through one reward cycle.';
-  return 'Deposit $' + capital + ' of USDC into ' + label + ' on ' + chain + ' and keep the position open.';
+  if (kind.includes('uncollateralized')) return 'If ' + label + ' lends to a borrower pool, lend $' + capital + ' of USDC through it on ' + chain + ' and keep the loan receipts.';
+  if (kind.includes('cdp')) return 'If ' + label + ' mints a stablecoin against collateral, lock $' + capital + ' of USDC in it on ' + chain + ' and keep the collateral ratio above the liquidation line.';
+  if (kind.includes('lend') || kind.includes('collateral')) return 'If ' + label + ' runs a lending market, supply $' + capital + ' of USDC to it on ' + chain + ', borrow a small amount against it, and keep the health factor above the liquidation line.';
+  if (kind.includes('interest rate')) return 'If ' + label + ' offers interest-rate positions, deposit $' + capital + ' of USDC as margin for one on ' + chain + ', and close it before the rate leg moves against you.';
+  if (kind.includes('perpetual') || kind.includes('derivative')) return 'If ' + label + ' runs a perpetual or derivatives market, deposit $' + capital + ' of USDC as margin on ' + chain + ', open one small hedged position, and set a stop so it closes before liquidation.';
+  if (kind.includes('basis')) return 'If ' + label + ' runs a basis vault on ' + chain + ', deposit $' + capital + ' of USDC into it and hold the delta-neutral position while funding stays positive.';
+  if (kind.includes('options')) return 'If ' + label + ' runs an options vault on ' + chain + ', deposit $' + capital + ' of USDC into it and hold the vault shares through one expiry.';
+  if (kind.includes('leveraged farm')) return 'If ' + label + ' runs a leveraged farm on ' + chain + ', deposit $' + capital + ' of USDC into it at the lowest leverage it offers, and watch the borrow rate daily.';
+  if (kind.includes('dex')) return 'If ' + label + ' runs a liquidity pool on ' + chain + ', provide $' + capital + ' of liquidity to its main pool, keeping the position in range, and collect the trading fees.';
+  if (kind.includes('liquidity manager')) return 'If ' + label + ' runs a managed vault on ' + chain + ', deposit $' + capital + ' of USDC into it and let the manager rebalance the range; keep the shares.';
+  if (kind.includes('yield aggregator')) return 'If ' + label + ' runs a vault on ' + chain + ', deposit $' + capital + ' of USDC into its main vault and keep the shares while the strategy runs.';
+  if (kind.includes('yield')) return 'If ' + label + ' runs a yield vault on ' + chain + ', deposit $' + capital + ' of USDC into it and keep the shares while the yield runs.';
+  if (kind.includes('curator')) return 'If ' + label + ' runs a curated vault on ' + chain + ', deposit $' + capital + ' of USDC into it and keep the vault shares; the curator picks the underlying markets, not you.';
+  if (kind.includes('allocator')) return 'If ' + label + ' runs an allocator vault on ' + chain + ', deposit $' + capital + ' of USDC into it and let it rotate the funds between strategies.';
+  if (kind.includes('restak')) return 'If ' + label + ' accepts restaking on ' + chain + ', restake $' + capital + ' of the receipt token through it and keep the restaking receipt.';
+  if (kind.includes('staking')) return 'If ' + label + ' runs staking on ' + chain + ', stake $' + capital + ' of the chain\'s staking asset through it and keep the receipt token.';
+  if (kind.includes('bridge')) return 'If ' + label + ' bridges USDC to ' + chain + ', bridge $' + capital + ' of USDC through it and use the bridged funds in its app the same week.';
+  if (kind.includes('chain')) return 'Bridge $' + capital + ' of USDC to ' + label + ' and, if it runs native apps, use two of them in the same week, starting with the largest one you can find on its own page.';
+  if (kind.includes('rwa')) return 'If ' + label + ' issues a yield-bearing asset on ' + chain + ', mint $' + capital + ' of it and hold it; read the backing report on the protocol\'s own page first.';
+  if (kind.includes('wrapper')) return 'If ' + label + ' wraps USDC into a wrapped stable on ' + chain + ', wrap $' + capital + ' of it and hold the wrapped tokens.';
+  if (kind.includes('stable')) return 'If ' + label + ' issues or holds a stable asset on ' + chain + ', mint or deposit $' + capital + ' of it and hold it through one peg check a week.';
+  if (kind.includes('btc')) return 'If ' + label + ' accepts BTC deposits on ' + chain + ', deposit $' + capital + ' of BTC through it and keep the receipt token until the hold ends.';
+  if (kind.includes('prediction')) return 'If ' + label + ' runs a prediction market on ' + chain + ', fund $' + capital + ' and place one market position on it, then settle it when the market resolves.';
+  if (kind.includes('insurance')) return 'If ' + label + ' sells cover on ' + chain + ', buy $' + capital + ' of it and keep the policy open through the hold.';
+  if (kind.includes('launchpad')) return 'If ' + label + ' runs a launch on ' + chain + ', join one with $' + capital + ' on ' + chain + ' and hold the allocation through the lock-up.';
+  if (kind.includes('token locker')) return 'If ' + label + ' runs a locker on ' + chain + ', lock $' + capital + ' of an asset in it for the shortest term it offers.';
+  if (kind.includes('otc')) return 'If ' + label + ' runs an OTC desk on ' + chain + ', place one trade of $' + capital + ' through it and keep the trade receipt.';
+  if (kind.includes('cedefi')) return 'If ' + label + ' runs a CeDeFi vault on ' + chain + ', deposit $' + capital + ' of USDC into it and keep the position open; the vault runs off-chain strategies.';
+  if (kind.includes('payment')) return 'If ' + label + ' handles payments on ' + chain + ', pay or receive $' + capital + ' through it and keep the payment receipt.';
+  if (kind.includes('governance')) return 'If ' + label + ' has a governance asset and an open proposal, lock $' + capital + ' of it through ' + label + ' on ' + chain + ' and cast one vote.';
+  if (kind.includes('card')) return 'If ' + label + ' issues a card, spend $' + capital + ' through it on ' + chain + ' and keep the statement for the farm log.';
+  if (kind.includes('index')) return 'If ' + label + ' runs an index on ' + chain + ', buy $' + capital + ' of it and hold the shares through one rebalance.';
+  if (kind.includes('farm')) return 'If ' + label + ' runs a farm on ' + chain + ', deposit $' + capital + ' of USDC into it and keep the position open through one reward cycle.';
+  return 'If ' + label + ' accepts deposits on ' + chain + ', deposit $' + capital + ' of USDC into it and keep the position open.';
 }
 
 /** The weekly qualifying action for the protocol's kind; repeated weekly it reads as one farmer. */
@@ -1090,15 +1233,15 @@ function checkActionFor(entry: SnapshotProtocol, chain: string): string {
   const label = entry.name;
   if (kind.includes('lend') || kind.includes('cdp') || kind.includes('collateral')) return 'Open ' + label + '\'s dashboard on ' + chain + ' and check the borrow rate and your health factor.';
   if (kind.includes('interest rate') || kind.includes('perpetual') || kind.includes('derivative') || kind.includes('options') || kind.includes('basis')) return 'Open ' + label + '\'s trading page on ' + chain + ' and check funding, margin and any open position.';
-  if (kind.includes('dex') || kind.includes('liquidity manager')) return 'Open the pool page on ' + label + ' and check the fees earned and whether the position is still in range.';
-  if (kind.includes('staking') || kind.includes('restak')) return 'Open ' + label + '\'s staking page on ' + chain + ' and check the rewards accrued on your receipt token.';
+  if (kind.includes('dex') || kind.includes('liquidity manager')) return 'Open ' + label + '\'s page on ' + chain + ' and check the pool, if it runs one, and the fees earned and whether the position is still in range.';
+  if (kind.includes('staking') || kind.includes('restak')) return 'Open ' + label + '\'s page on ' + chain + ' and check the staking rewards accrued on your receipt token, if it runs staking.';
   if (kind.includes('rwa') || kind.includes('stable') || kind.includes('wrapper')) return 'Open ' + label + '\'s page on ' + chain + ' and check the peg and the backing report.';
-  if (kind.includes('yield') || kind.includes('curator') || kind.includes('allocator') || kind.includes('farm') || kind.includes('leveraged farm')) return 'Open ' + label + '\'s vault page on ' + chain + ' and check the yield accrued and the vault\'s current strategy.';
+  if (kind.includes('yield') || kind.includes('curator') || kind.includes('allocator') || kind.includes('farm') || kind.includes('leveraged farm')) return 'Open ' + label + '\'s page on ' + chain + ' and check the vault, if it runs one, and the yield accrued and the vault\'s current strategy.';
   if (kind.includes('bridge') || kind.includes('chain')) return 'Open ' + label + ' on ' + chain + ' and check the bridged balance arrived before you move on.';
   if (kind.includes('prediction')) return 'Open ' + label + ' and check whether your market has resolved.';
   if (kind.includes('governance')) return 'Open ' + label + '\'s governance page on ' + chain + ' and check the next proposal.';
   if (kind.includes('insurance')) return 'Open ' + label + '\'s cover page on ' + chain + ' and check the policy is still active.';
-  return 'Open ' + label + '\'s own points or rewards page on ' + chain + ' and check what the wallet has earned.';
+  return 'Open ' + label + '\'s own page on ' + chain + ' and check whether it runs a points or rewards program; if it does, check what the wallet has earned.';
 }
 
 /** How to unwind, in the order that kind demands: the loan before the supply, the trade before the margin. */
@@ -1132,14 +1275,14 @@ export function farmSteps(
   const stake = capitalFor(entry);
   const gas = gasRange(entry);
   const holdDays = holdDaysFor(age);
-  const secondChainClause = secondChain === null ? '' : ' Alternate weeks between ' + firstChain + ' and ' + secondChain + ' so both chains show activity.';
+  const secondChainClause = secondChain === null ? '' : ' If you farm on both chains, alternate weeks between ' + firstChain + ' and ' + secondChain + '.';
   const youngClause = age !== null && age < 90 ? ' The protocol is only ' + age + ' days old, so check its announcements weekly too.' : '';
   const logSecond = secondChain === null ? '' : ' Note the second chain, ' + secondChain + ', if you farmed there too.';
   const mk = (text: string, cost: string, time: string): FarmStep => ({ text, cost, time });
   const plan: FarmStep[] = [
     mk('Set up a fresh wallet on ' + firstChain + ' with $' + stake + ' of USDC and gas money of roughly ' + gas + ' (an estimate, gas moves with the network), and keep its seed phrase offline. ' + growthNote(entry), 'gas of roughly ' + gas + ' (estimate) to fund the wallet', '10 minutes'),
     mk(actionFor(entry, stake, firstChain), '$' + stake + ' of capital and gas of roughly ' + gas + ' (estimate)', '15 minutes to set up'),
-    mk('Do one qualifying action each week, such as ' + weeklyActionFor(entry) + ', so the wallet reads as active rather than one-off.' + secondChainClause + youngClause, 'a few dollars of gas a week', '10 minutes a week'),
+    mk('If ' + entry.name + ' runs a points program, do one qualifying action each week, such as ' + weeklyActionFor(entry) + ', so the week\'s activity counts toward it.' + secondChainClause + youngClause, 'a few dollars of gas a week', '10 minutes a week'),
     mk('Hold the position for at least ' + holdDays + ' days so the activity is counted in more than one snapshot. ' + ageNote(age, holdDays) + ' TVL is ' + fmtTvl(entry.tvl_usd) + ', so your $' + stake + ' position is a small share of the pool.', 'the $' + stake + ' stays in the position', holdDays + ' days'),
     mk(checkActionFor(entry, firstChain) + ' Claim only from the link the protocol itself publishes, and never pay to claim.', 'no fee to check, and never pay to claim', '10 minutes'),
     mk('Write the wallet, the dates and every transaction in a farm log: ' + entry.name + ' on ' + firstChain + ', $' + stake + ' entered, hold ends after ' + holdDays + ' days.' + logSecond, 'nothing but the log', '5 minutes'),
@@ -1184,11 +1327,13 @@ export function radarRow(
     listed_at: boardRow.listed_at, age_days: boardRow.age_days,
     implied_value_usd: boardRow.implied_value_usd,
     value_if_launches_usd: boardRow.value_if_launches_usd,
-    launch_odds: boardRow.launch_odds,
+    propensity: boardRow.propensity,
     range_lo_usd: boardRow.range_lo_usd, range_hi_usd: boardRow.range_hi_usd,
     range_lo10_usd: boardRow.range_lo10_usd, range_hi90_usd: boardRow.range_hi90_usd,
     farm_verdict: boardRow.farm_verdict, off_list: boardRow.off_list,
     net_1000_usd: boardRow.net_1000_usd, net_10000_usd: boardRow.net_10000_usd,
+    net_1000_conservative_usd: boardRow.net_1000_conservative_usd,
+    net_1000_optimistic_usd: boardRow.net_1000_optimistic_usd,
     growth_factor: boardRow.model.growth_factor,
     chain_factor: boardRow.model.chain_factor,
     tvl_base: boardRow.model.tvl_base,
@@ -1214,16 +1359,16 @@ function spearman(v2Rank: Map<string, number>, currentRank: Map<string, number>)
 }
 
 /**
- * The five ratios that carry a row from its radar-2 value to its radar-4 value: their product
- * is implied_v4 / implied_v2, within a dollar of rounding. Growth is the category-relative
+ * The five ratios that carry a row from its radar-2 value to its radar-5 value: their product
+ * is implied_v5 / implied_v2, within a dollar of rounding. Growth is the category-relative
  * tanh factor over the old clamped factor; compression is the sub-linear base over the old
  * linear one; age is the old maturity factor dropped; chain is the 3% step over the old 4%;
- * odds is the launch-odds discount radar-4 applies to the radar-3 value.
+ * propensity is the tokenization-propensity discount radar-5 applies to the radar-3 value.
  */
 function changeRatios(
   row: BoardRow,
   tvlMedian: number,
-): { growth: number; compression: number; age: number; chain: number; odds: number } {
+): { growth: number; compression: number; age: number; chain: number; propensity: number } {
   const change = row.change_7d === null ? 0 : row.change_7d;
   const clamped = Math.max(MODEL_V2.growth_floor, Math.min(MODEL_V2.growth_cap, change));
   const growthV2 = 1 + (clamped / 100) * MODEL_V2.growth_weight;
@@ -1236,7 +1381,7 @@ function changeRatios(
   const chainBonus = Math.max(0, Math.min(row.chains.length - 1, MODEL_V2.chain_max_steps));
   const chainV2 = 1 + chainBonus * MODEL_V2.chain_step;
   const chain = row.model.chain_factor / chainV2;
-  return { growth, compression, age, chain, odds: row.launch_odds };
+  return { growth, compression, age, chain, propensity: row.propensity };
 }
 
 /** One line saying which factor drove a row's move between the releases. Each factor is measured
@@ -1244,8 +1389,8 @@ function changeRatios(
  * the board, not what moved the whole board. */
 function moveReason(
   row: BoardRow,
-  ratios: { growth: number; compression: number; age: number; chain: number; odds: number },
-  medians: { growth: number; compression: number; age: number; chain: number; odds: number },
+  ratios: { growth: number; compression: number; age: number; chain: number; propensity: number },
+  medians: { growth: number; compression: number; age: number; chain: number; propensity: number },
   movedUp: boolean,
 ): string {
   const relative = {
@@ -1253,9 +1398,9 @@ function moveReason(
     compression: ratios.compression / medians.compression,
     age: ratios.age / medians.age,
     chain: ratios.chain / medians.chain,
-    odds: ratios.odds / medians.odds,
+    propensity: ratios.propensity / medians.propensity,
   };
-  const entries: Array<[string, number]> = [['growth', relative.growth], ['compression', relative.compression], ['age', relative.age], ['chain', relative.chain], ['odds', relative.odds]];
+  const entries: Array<[string, number]> = [['growth', relative.growth], ['compression', relative.compression], ['age', relative.age], ['chain', relative.chain], ['propensity', relative.propensity]];
   const inDirection = entries.filter(([, value]) => (movedUp ? value > 1 : value < 1));
   const pick = (inDirection.length > 0 ? inDirection : entries)
     .sort((a, b) => Math.abs(Math.log(b[1])) - Math.abs(Math.log(a[1])))[0]!;
@@ -1267,7 +1412,7 @@ function moveReason(
     const clamped = Math.max(MODEL_V2.growth_floor, Math.min(MODEL_V2.growth_cap, change));
     const growthV2 = 1 + (clamped / 100) * MODEL_V2.growth_weight;
     if (movedUp) return 'Outgrew its category: seven-day change ' + fmtPct(change) + ' against a ' + (row.category ?? 'Other') + ' median of ' + fmtPct(catMedian) + ' (growth ' + row.model.growth_factor.toFixed(2) + 'x, where radar-2 paid ' + growthV2.toFixed(2) + 'x).';
-    if (growthV2 >= 1.5) return 'The seven-day spike radar-2 rewarded at ' + growthV2.toFixed(2) + 'x is capped at ' + row.model.growth_factor.toFixed(2) + 'x under radar-4: seven-day change ' + fmtPct(change) + ' against a ' + (row.category ?? 'Other') + ' median of ' + fmtPct(catMedian) + '.';
+    if (growthV2 >= 1.5) return 'The seven-day spike radar-2 rewarded at ' + growthV2.toFixed(2) + 'x is capped at ' + row.model.growth_factor.toFixed(2) + 'x under radar-5: seven-day change ' + fmtPct(change) + ' against a ' + (row.category ?? 'Other') + ' median of ' + fmtPct(catMedian) + '.';
     return 'Lagged its category: seven-day change ' + fmtPct(change) + ' against a ' + (row.category ?? 'Other') + ' median of ' + fmtPct(catMedian) + ' (growth ' + row.model.growth_factor.toFixed(2) + 'x, where radar-2 paid ' + growthV2.toFixed(2) + 'x).';
   }
   if (kind === 'compression') {
@@ -1278,14 +1423,14 @@ function moveReason(
     if (movedUp) return 'Young protocol: the age discount is gone, so it is no longer held back for being ' + (row.age_days === null ? 'unlisted' : String(row.age_days)) + ' days old.';
     return 'Old protocol: at ' + (row.age_days === null ? 'unlisted' : String(row.age_days)) + ' days it gets no lift from the age discount being gone, while younger protocols around it rise.';
   }
-  if (kind === 'odds') {
-    if (movedUp) return 'High launch odds of ' + Math.round(row.launch_odds * 100) + '% lift it: the value-if-it-launches is barely discounted.';
-    return 'Low launch odds of ' + Math.round(row.launch_odds * 100) + '% hold it back: most of the value-if-it-launches is discounted away.';
+  if (kind === 'propensity') {
+    if (movedUp) return 'High tokenization propensity of ' + Math.round(row.propensity * 100) + '% lifts it: the value-if-it-launches is barely discounted.';
+    return 'Low tokenization propensity of ' + Math.round(row.propensity * 100) + '% holds it back: most of the value-if-it-launches is discounted away.';
   }
   return 'Chain breadth: the chain step fell from 4% to 3%, so extra chains count for less than they did.';
 }
 
-/** The radar-2 versus radar-4 comparison: Spearman correlation and the biggest movers. */
+/** The radar-2 versus radar-5 comparison: Spearman correlation and the biggest movers. */
 function buildComparison(
   ranked: BoardRow[],
   v2RankBySlug: Map<string, number>,
@@ -1294,14 +1439,14 @@ function buildComparison(
   ranked.forEach((row, i) => currentRankBySlug.set(row.slug, i + 1));
   const spearmanValue = spearman(v2RankBySlug, currentRankBySlug);
   const tvlMedian = ranked[0]?.model.tvl_median ?? 0;
-  const ratiosBySlug = new Map<string, { growth: number; compression: number; age: number; chain: number; odds: number }>();
+  const ratiosBySlug = new Map<string, { growth: number; compression: number; age: number; chain: number; propensity: number }>();
   for (const row of ranked) ratiosBySlug.set(row.slug, changeRatios(row, tvlMedian));
   const medians = {
     growth: median([...ratiosBySlug.values()].map((r) => r.growth).sort((a, b) => a - b)) ?? 1,
     compression: median([...ratiosBySlug.values()].map((r) => r.compression).sort((a, b) => a - b)) ?? 1,
     age: median([...ratiosBySlug.values()].map((r) => r.age).sort((a, b) => a - b)) ?? 1,
     chain: median([...ratiosBySlug.values()].map((r) => r.chain).sort((a, b) => a - b)) ?? 1,
-    odds: median([...ratiosBySlug.values()].map((r) => r.odds).sort((a, b) => a - b)) ?? 1,
+    propensity: median([...ratiosBySlug.values()].map((r) => r.propensity).sort((a, b) => a - b)) ?? 1,
   };
   const movers = ranked.map((row) => {
     const v2Rank = v2RankBySlug.get(row.slug) ?? 0;
@@ -1324,10 +1469,18 @@ export function buildRadar(
   snapshot: Snapshot,
   model: ModelConstants = MODEL,
 ): { board: BoardRow[]; radar: RadarData } {
-  const odds = fitOddsModel(snapshot);
-  const holdout = holdoutValidation(snapshot, model);
+  const propensity = fitPropensityModel(snapshot);
+  // Directional scale calibration: the first holdout pass prices the traded tokens with the
+  // round 0.25 base; k is the median log ratio of actual cap to predicted value, so the
+  // second pass — and the board — run on 0.25 x k, the scale the traded tokens themselves
+  // imply. The holdout numbers the dashboard prints come from the second pass, with the
+  // calibrated base in place.
+  const firstHoldout = holdoutValidation(snapshot, model);
+  const scaleK = Math.exp(firstHoldout.log_p50);
+  const calibrated: ModelConstants = { ...model, base_multiple: model.base_multiple * scaleK };
+  const holdout = holdoutValidation(snapshot, calibrated);
   const accounting = accountingOf(snapshot);
-  const ranked = buildBoard(snapshot, model, odds, holdout);
+  const ranked = buildBoard(snapshot, calibrated, propensity, holdout);
   const liveSet = liveRows(snapshot);
   const early = ranked.filter((r) => snapshot.watchlist.includes(r.slug) === false).length;
   // The radar-2 comparison: score the same rows with the old function and rank them the same
@@ -1371,10 +1524,10 @@ export function buildRadar(
     else verdictCounts.skip++;
   }
   const totalImplied = ranked.reduce((sum, row) => sum + row.implied_value_usd, 0);
-  const meanOdds = ranked.length === 0 ? 0 : Math.round((ranked.reduce((sum, row) => sum + row.launch_odds, 0) / ranked.length) * 10000) / 10000;
+  const meanPropensity = ranked.length === 0 ? 0 : Math.round((ranked.reduce((sum, row) => sum + row.propensity, 0) / ranked.length) * 10000) / 10000;
   const radarData: RadarData = {
     as_of: snapshot.as_of, source: snapshot.source, floor_usd: snapshot.floor_usd,
-    model, model_version: MODEL_VERSION,
+    model: calibrated, model_version: MODEL_VERSION,
     watchlist_size: snapshot.watchlist.length, board_size: ranked.length,
     early_size: early, live_size: liveSet.length,
     rows: ranked.map((row) => {
@@ -1383,8 +1536,9 @@ export function buildRadar(
     }),
     live: liveSet,
     comparison,
-    odds, holdout, accounting, verdict_counts: verdictCounts,
-    total_implied_usd: totalImplied, mean_odds: meanOdds, base_rate: odds.base_rate,
+    propensity, holdout, accounting, verdict_counts: verdictCounts,
+    total_implied_usd: totalImplied, mean_propensity: meanPropensity, base_rate: propensity.base_rate,
+    scale_k: Math.round(scaleK * 10000) / 10000,
   };
   return { board: ranked, radar: radarData };
 }
@@ -1450,9 +1604,9 @@ export function boardIssue(
     if (steps.length < 3 || steps.length > 12) return row.slug + ' has ' + steps.length + ' farm steps';
     for (const s of steps) if (s.length < 20 || s.length > 600) return row.slug + ' has a farm step of ' + s.length + ' characters';
     if (Number.isSafeInteger(row.implied_value_usd) === false || row.implied_value_usd <= 0) return row.slug + ' has implied value ' + row.implied_value_usd;
-    const expected = Math.max(1, Math.round(row.value_if_launches_usd * row.launch_odds));
-    if (row.implied_value_usd !== expected) return row.slug + ' has implied value ' + row.implied_value_usd + ' but value times odds is ' + expected;
-    if (row.launch_odds <= 0 || row.launch_odds > 1) return row.slug + ' has launch odds ' + row.launch_odds;
+    const expected = Math.max(1, Math.round(row.value_if_launches_usd * row.propensity));
+    if (row.implied_value_usd !== expected) return row.slug + ' has implied value ' + row.implied_value_usd + ' but value times propensity is ' + expected;
+    if (row.propensity <= 0 || row.propensity > 1) return row.slug + ' has propensity ' + row.propensity;
     if (row.range_lo_usd > row.implied_value_usd || row.implied_value_usd > row.range_hi_usd) return row.slug + ' has an implied value outside its printed range';
   }
   return null;

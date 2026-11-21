@@ -1,9 +1,9 @@
-// Token Radar's dashboard, model radar-8. It reads window.RADAR (written beside dashboard/ by
+// Token Radar's dashboard, model radar-9. It reads window.RADAR (written beside dashboard/ by
 // main.ts) and renders the ranked board, a filterable table, and a per-protocol detail drawer
 // with the model inputs and farm plan. No network: every byte shown is in data.js. launchValueOf
 // recomputes a row's launch value (the primary USD value and the ranking) — the flat TVL multiple
 // when the rolling validation falls back to flat, otherwise the log-space blend with the radar
-// formula — priorityOf the unitless risk-adjusted score (launch value times propensity, never
+// formula — priorityOf the unitless propensity-weighted priority (launch value times propensity, never
 // dollars), propensityOf the fitted score under its feature spec, v2ImpliedOf the previous
 // release's value. The drawer shows the farm plan board.json carries for the row.
 (function () {
@@ -109,7 +109,7 @@
     if (alpha <= 0) return Math.max(1, Math.round(flat));
     return Math.max(1, Math.round(Math.exp(alpha * Math.log(Math.max(1, radar)) + (1 - alpha) * Math.log(Math.max(1, flat)))));
   }
-  // The risk-adjusted score: launch value times propensity, a unitless sort aid — never
+  // The propensity-weighted priority: launch value times propensity, a unitless sort aid — never
   // dollars, never an expected value.
   function priorityOf(row) {
     return Math.round(valueIfLaunchesOf(row) * propensityOf(row) * 100) / 100;
@@ -248,7 +248,7 @@
     return el('section', { class: 'lede' },
       el('div', null,
         el('h1', { text: DATA.watchlist_size + ' watchlist protocols, ranked by launch value' }),
-        el('p', { text: 'The watchlist is the floor: every protocol with at least $' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL and no token on record. The early radar adds ' + DATA.early_size + ' more pre-token protocols the house rule keeps — ' + (DATA.early_size - offList) + ' below that floor, ' + offList + ' above it that the watchlist skips, flagged OFF LIST. Launch value is what a protocol would be worth if it launched a token — the ranking, and a model, not a promise. Propensity is a separate indicator; the risk-adjusted score is launch value x propensity, unitless.' })
+        el('p', { text: 'The watchlist is the floor: every protocol with at least $' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL and no token on record. The early radar adds ' + DATA.early_size + ' more pre-token protocols the house rule keeps — ' + (DATA.early_size - offList) + ' below that floor, ' + offList + ' above it that the watchlist skips, flagged OFF LIST. Launch value is what a protocol would be worth if it launched a token — the ranking, and a model, not a promise. Propensity is a separate indicator; the propensity-weighted priority is launch value x propensity, unitless.' })
       ),
       el('div', { class: 'facts' },
         el('div', { class: 'fact' }, el('span', { text: 'Watchlist covered' }), el('b', { text: DATA.watchlist_size + ' / ' + DATA.watchlist_size })),
@@ -341,16 +341,16 @@
     );
   }
 
-  // Radar-2 versus radar-8: the build computes the correlation and movers; the page renders them.
+  // Radar-2 versus radar-9: the build computes the correlation and movers; the page renders them.
   // The rolling sentence reads the validation in data.js, so it says flat when the board uses
   // flat and names the blend when a blend passes the gate.
   function rollingSentence() {
     var r = DATA.rolling;
-    if (!r) return 'Radar-8 measures growth against the protocol\'s own category, drops the age discount, and keeps propensity out of the dollar value.';
+    if (!r) return 'Radar-9 measures growth against the protocol\'s own category, drops the age discount, and keeps propensity out of the dollar value.';
     var best = Math.min.apply(null, r.pooled_miss_by_alpha);
     var pct = Math.round((1 - best / r.flat_pooled_miss) * 100);
-    if (r.board_uses_flat) return 'Radar-8 ranks by the flat TVL multiple: the strict rolling validation found no blend of the radar formula that beats flat TVL out of time — on blocks 1–3 the best blend is only ' + pct + '% below flat, short of the 10% the two-stage gate needs, and the held-out block can only veto — so the board uses flat and the radar formula stays as an auxiliary valuation per row. Growth is measured against the protocol\'s own category, the age discount is dropped, and propensity stays out of the dollar value.';
-    return 'Radar-8 blends the radar formula with the flat TVL multiple at alpha ' + r.chosen_alpha + ' in log space, chosen by the strict rolling validation — the best blend is ' + pct + '% below flat on blocks 1–3, and the held-out block does not veto it. Growth is measured against the protocol\'s own category, the age discount is dropped, and propensity stays out of the dollar value.';
+    if (r.board_uses_flat) return 'Radar-9 ranks by the flat TVL multiple: the strict rolling validation found no blend of the radar formula that beats flat TVL out of time — on blocks 1–3 the best blend is only ' + pct + '% below flat, short of the 10% the two-stage gate needs, and the held-out block can only veto — so the board uses flat and the radar formula stays as an auxiliary valuation per row. Growth is measured against the protocol\'s own category, the age discount is dropped, and propensity stays out of the dollar value.';
+    return 'Radar-9 blends the radar formula with the flat TVL multiple at alpha ' + r.chosen_alpha + ' in log space, chosen by the strict rolling validation — the best blend is ' + pct + '% below flat on blocks 1–3, and the held-out block does not veto it. Growth is measured against the protocol\'s own category, the age discount is dropped, and propensity stays out of the dollar value.';
   }
   function comparisonPanel() {
     var comp = DATA.comparison;
@@ -358,13 +358,13 @@
     var mover = function (m) {
       return el('div', { class: 'mover' },
         el('b', { text: m.name }),
-        el('span', { class: 'num', text: 'radar-2 #' + m.v2_rank + '  →  radar-8 #' + m.current_rank }),
+        el('span', { class: 'num', text: 'radar-2 #' + m.v2_rank + '  →  radar-9 #' + m.current_rank }),
         el('span', { class: 'sub', text: m.reason })
       );
     };
-    return el('section', { class: 'panel compare', 'aria-label': 'Radar-2 vs radar-8' },
+    return el('section', { class: 'panel compare', 'aria-label': 'Radar-2 vs radar-9' },
       el('div', { class: 'overview-head' },
-        el('h2', { text: 'Radar-2 vs radar-8: what changed' }),
+        el('h2', { text: 'Radar-2 vs radar-9: what changed' }),
         el('p', { class: 'sub', text: 'Spearman ' + comp.spearman.toFixed(2) + ' — the models mostly agree. ' + rollingSentence() })
       ),
       el('div', { class: 'movers' },
@@ -392,6 +392,8 @@
     var terms = (o.features || []).map(function (name, i) { return sign(w[i + 1]) + ' x ' + (featureLabel[name] || name); }).join(' ');
     var accounting = DATA.accounting.map(function (g) { return g.count + ' ' + g.label.toLowerCase(); }).join(' · ');
     var vc = DATA.verdict_counts;
+    var flip50 = DATA.rows.filter(function (r) { return r.farm_verdict === 'Marginal' && r.verdict_gas50 === 'Skip'; }).length;
+    var flip100 = DATA.rows.filter(function (r) { return r.farm_verdict === 'Marginal' && r.verdict_gas100 === 'Skip'; }).length;
     var cal = o.calibration.map(function (b) { return Math.round(b.center * 100) + '% → ' + Math.round(b.actual * 100) + '% (n=' + b.n + ')'; }).join(', ');
     var ts = o.time_split;
     return el('section', { class: 'panel odds', 'aria-label': 'Propensity and holdout checks' },
@@ -408,7 +410,7 @@
       el('p', { class: 'sub', text: 'Checked on the ' + h.loo_n + ' traded tokens, with nested calibration — each test sample\'s scale comes from the others, never its own cap. Leave-one-out: median miss x' + h.loo_median_miss.toFixed(2) + ', against x' + h.loo_flat_median_miss.toFixed(2) + ' for a flat TVL multiple; ' + Math.round(h.loo_within_2x * 100) + '% of caps land within 2x. By time — older half fits, newer half priced, split ' + h.bytime_split + ', ' + h.bytime_n + ' tokens — median miss x' + h.bytime_median_miss.toFixed(2) + ' against x' + h.bytime_flat_median_miss.toFixed(2) + '. The scale drifts: the old half\'s median log error is ' + h.bytime_train_log_median.toFixed(2) + ', the new half\'s ' + h.bytime_test_log_median.toFixed(2) + '. The value base is 0.25 x ' + DATA.scale_k.toFixed(2) + ', the scale the traded tokens imply.' }),
       el('p', { class: 'sub', text: 'Uncertainty has two layers. (1) The printed range is the value IF it launches, from the older half\'s leave-one-out errors (x' + h.range_lo_factor.toFixed(2) + ' to x' + h.range_hi_factor.toFixed(2) + ' for the Historical model error range, P20–P80; P10–P90 x' + h.range_lo10_factor.toFixed(2) + ' to x' + h.range_hi90_factor.toFixed(2) + '). (2) The propensity band is the launch uncertainty — P10–P90 is not an 80% confidence interval on the airdrop value. On the by-time held-out caps, ' + Math.round(h.coverage_central60 * 100) + '% fall inside the printed range, ' + Math.round(h.coverage_1090 * 100) + '% inside P10–P90 — the bands are cut from the older half only, so this coverage is a strict held-out number; the nominal targets are 60% and 80%.' }),
       el('p', { class: 'sub', text: '758 protocols, accounted for: ' + accounting + '.' }),
-      el('p', { class: 'sub', text: 'Farm verdicts, judged on each plan size: Farm needs the 1% net above $10 on the $1,000 plan; Marginal the 3% net above $0 — on the $1,000 plan, or on the $10,000 plan when the small plan does not clear it; Skip neither. ' + vc.farm + ' Farm · ' + vc.marginal + ' Marginal · ' + vc.skip + ' Skip. Gas is counted per transaction on its chain — 7 for a 30-day hold, 9 for 45, 11 for 60 — so a longer hold costs more. Rewards are conditional — assuming launch and a pro-rata drop allocation — not expected returns. Risks: protocol failure, impermanent loss, bridging costs.' }),
+      el('p', { class: 'sub', text: 'Farm verdicts, judged on each plan size: Farm needs the 1% net above $10 on the $1,000 plan; Marginal the 3% net above $0 — on the $1,000 plan, or on the $10,000 plan when the small plan does not clear it; Skip neither. ' + vc.farm + ' Farm · ' + vc.marginal + ' Marginal · ' + vc.skip + ' Skip. Gas is counted per transaction on its chain — 7 for a 30-day hold, 9 for 45, 11 for 60 — so a longer hold costs more. Rewards are conditional — assuming launch and a pro-rata drop allocation — not expected returns. Gas sensitivity: at gas +50%, ' + flip50 + ' of the ' + vc.marginal + ' Marginal rows become Skip; at gas +100%, ' + flip100 + ' do — the verdicts above do not change. Risks: protocol failure, impermanent loss, bridging costs.' }),
       el('p', { class: 'sub', text: 'Two different goals: the board ranks by launch value; the farm verdict is the conditional net of a plan — a top-ranked protocol can still be a Skip on a small plan.' })
     );
   }
@@ -549,7 +551,7 @@
     return el('div', { class: 'panel' },
       el('div', { class: 'table-wrap' },
         el('table', null,
-          el('caption', { class: 'sub', text: 'Pre-token protocols, strongest launch value first. Priority is the risk-adjusted score — launch value x propensity, unitless, never dollars. Select a row for the model and farm plan.' }),
+          el('caption', { class: 'sub', text: 'Pre-token protocols, strongest launch value first. Priority is the propensity-weighted priority — launch value x propensity, unitless, never dollars. Select a row for the model and farm plan.' }),
           el('thead', null, el('tr', null,
             sortHeader('implied', 'Rank'),
             sortHeader('name', 'Protocol'),
@@ -656,13 +658,13 @@
         el('div', null, el('span', { text: 'Flat TVL value: ' + DATA.flat_multiple.toFixed(4) + ' x TVL' }), el('b', { class: 'num', text: fmtUsd(flatValueOf(row)) })),
         el('div', null, el('span', { text: 'Auxiliary radar value (TVL base x growth x chain)' }), el('b', { class: 'num', text: fmtUsd(radarValueOf(row)) })),
         el('div', null, el('span', { text: 'Tokenization propensity (' + propensityBand(propensityOf(row)) + ') — indicator only' }), el('b', { class: 'num', text: Math.round(propensityOf(row) * 100) + '%' })),
-        el('div', null, el('span', { text: 'Risk-adjusted score (unitless)' }), el('b', { class: 'num', text: fmtNum(prio) })),
+        el('div', null, el('span', { text: 'Propensity-weighted priority (unitless)' }), el('b', { class: 'num', text: fmtNum(prio) })),
         el('div', null, el('span', { text: 'Rank under flat / radar' }), el('b', { class: 'num', text: '#' + row.flat_rank + ' / #' + row.radar_rank + ' (' + (row.rank_diff >= 0 ? '+' : '') + row.rank_diff + ')' })),
         el('div', { class: 'total' }, el('span', { text: 'Launch value (the ranking value)' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
       el('p', { class: 'sub', text: valueText + 'Age with no token, ' + fmtAge(row.age_days) + ', does not enter either value. The page recomputes this row as ' + fmtUsd(recomputed) + (match ? ', the same number board.json carries' : ', which differs from the board: the data would be stale') + ', and its priority score as ' + fmtNum(prio) + (prioMatch ? ', matching.' : ', differing: the data would be stale.') + ' This is an estimate, not a price.' }),
       el('p', { class: 'sub', text: 'Two layers. (1) Value if it launches: ' + fmtUsd(row.range_lo_usd) + ' to ' + fmtUsd(row.range_hi_usd) + ' (Historical model error range, P20–P80), ' + fmtUsd(row.range_lo10_usd) + ' to ' + fmtUsd(row.range_hi90_usd) + ' (P10–P90), cut from the older half\'s holdout errors. (2) Whether it launches: propensity ' + Math.round(row.propensity * 100) + '% (' + propensityBand(row.propensity) + '), a cross-sectional score, not a calibrated chance. P10–P90 is not an 80% confidence interval on the final airdrop value. Farm verdict ' + row.farm_verdict + ' on a $' + row.farm_plan_size + ' plan: ' + netsText + ', less ' + ntx + ' transactions of gas and the cost of the capital. Conditional on launch and a pro-rata drop — not an expected return.' }),
-      el('p', { class: 'sub', text: 'Under radar-2 this protocol ranked #' + row.v2_rank + ' with an implied value of ' + fmtUsd(row.v2_implied) + ' (recomputed ' + fmtUsd(v2recomputed) + (v2match ? ', matching.' : ', differing: the data would be stale.') + ' Radar-8 ranks it #' + row.rank + '.' }),
+      el('p', { class: 'sub', text: 'Under radar-2 this protocol ranked #' + row.v2_rank + ' with an implied value of ' + fmtUsd(row.v2_implied) + ' (recomputed ' + fmtUsd(v2recomputed) + (v2match ? ', matching.' : ', differing: the data would be stale.') + ' Radar-9 ranks it #' + row.rank + '.' }),
       standing ? el('p', { class: 'sub', text: standing + '.' }) : null
     ));
     var capital = row.farm_plan_size || 1000;
@@ -672,11 +674,14 @@
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'Capital for one position' }), el('b', { class: 'num', text: '$' + capital })),
         el('div', null, el('span', { text: 'Gas budget, ' + ntx + ' transactions (estimate)' }), el('b', { class: 'num', text: '$' + gasTotal.toFixed(2) })),
+        el('div', null, el('span', { text: 'Break-even drop share' }), el('b', { class: 'num', text: (row.breakeven_drop_share * 100).toFixed(2) + '%' })),
+        el('div', null, el('span', { text: 'Net at 3%, gas +50% (' + row.verdict_gas50 + ')' }), el('b', { class: 'num', text: fmtUsd(row.net_plan_gas50_usd) })),
+        el('div', null, el('span', { text: 'Net at 3%, gas +100% (' + row.verdict_gas100 + ')' }), el('b', { class: 'num', text: fmtUsd(row.net_plan_gas100_usd) })),
         el('div', null, el('span', { text: 'Plan state' }), el('b', { class: 'num', text: row.plan_state || 'Conditional' })),
         el('div', null, el('span', { text: 'Hold at least' }), el('b', { class: 'num', text: hold + ' days' })),
         el('div', null, el('span', { text: 'Exit rule' }), el('b', { class: 'num', text: 'unwind if TVL halves from ' + fmtTvl(row.tvl_usd) }))
       ),
-      el('p', { class: 'sub', text: 'Gas moves with the network; the budget is conservative, not a live quote. Rewards assume the drop is split by capital share of TVL; real drops pay on points and activity. Risks: protocol failure, impermanent loss, bridging costs. Nothing here promises a token or an airdrop.' })
+      el('p', { class: 'sub', text: 'Gas moves with the network; the budget is conservative, not a live quote. Rewards assume the drop is split by capital share of TVL; real drops pay on points and activity. Break-even is the drop share where the reward covers the gas plus the 5% annual cost of the capital over the hold — above 100% the plan never breaks even. The gas sensitivity is shown only; the verdict above does not change. Risks: protocol failure, impermanent loss, bridging costs. Nothing here promises a token or an airdrop.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan' }),

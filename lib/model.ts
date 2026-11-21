@@ -1,4 +1,4 @@
-// Token Radar's scoring model, release radar-8: a sealed snapshot goes in, a ranked board comes out.
+// Token Radar's scoring model, release radar-9: a sealed snapshot goes in, a ranked board comes out.
 //
 // Which protocols make the board. The board always carries every slug the snapshot's watchlist
 // names — that list is the floor, never the ceiling — and on top of it the early radar adds
@@ -51,11 +51,11 @@
 //                          final spec has no age term — see the ablation in
 //                          fitPropensityModel. Age never enters the value either: a protocol
 //                          that has run three years with no token is not worth more.
-//   risk-adjusted score  = launch value x tokenization propensity, a unitless sort aid
-//                          only — never labelled USD, never called an expected value. The
-//                          dashboard offers it as an alternate sort; the board's rank,
-//                          and the implied_value_usd field the gate checks, are the launch
-//                          value.
+//   propensity-weighted priority = launch value x tokenization propensity, a unitless
+//                                  sort aid only — never labelled USD, never called an
+//                                  expected value. The dashboard offers it as an alternate
+//                                  sort; the board's rank, and the implied_value_usd field
+//                                  the gate checks, are the launch value.
 //
 // The value formula is checked out of sample, not just fitted: leave-one-out over the traded
 // tokens and by-time (the older half fits the model that prices the newer half), each against
@@ -142,7 +142,7 @@ export const MODEL_V2: ModelConstantsV2 = { // radar-2, comparison only
 };
 
 /** The model release label, the one the dashboard shows. */
-export const MODEL_VERSION: string = 'radar-8';
+export const MODEL_VERSION: string = 'radar-9';
 
 /** Live-token rows in the dashboard's Live token view, by market cap. */
 export const LIVE_ROWS: number = 24;
@@ -405,6 +405,11 @@ export interface BoardRow {
   farm_plan_size: number; // the plan size the verdict and the farm steps use: $1,000, or $10,000 for a Marginal earned on the large plan
   plan_state: PlanState; // Category-supported, Conditional or Research first — how executable the farm plan is
   gas_total_usd: number; // the backend-computed gas total for the row's farm plan, dollars — the dashboard displays this number, it never recomputes gas
+  breakeven_drop_share: number; // the drop share at which the row's farm plan breaks even — the share where the reward covers the gas plus the 5% annual cost of the capital over the hold; above 1 the plan never breaks even
+  net_plan_gas50_usd: number; // conditional net at the row's plan size, neutral 3% drop, with the gas budget at +50% — sensitivity only, the verdict never changes
+  net_plan_gas100_usd: number; // conditional net at the row's plan size, neutral 3% drop, with the gas budget doubled — sensitivity only
+  verdict_gas50: FarmVerdict; // the farm verdict recomputed with the gas budget at +50% — sensitivity only, the row's verdict never changes
+  verdict_gas100: FarmVerdict; // the farm verdict recomputed with the gas budget doubled — sensitivity only
   flat_rank: number; // the row's rank by flat TVL value alone
   radar_rank: number; // the row's rank by the radar formula alone
   rank_diff: number; // flat_rank minus radar_rank: positive when the radar formula ranks the protocol higher than flat TVL does
@@ -447,6 +452,11 @@ export interface RadarRow {
   farm_plan_size: number; // the plan size the verdict and the farm steps use: $1,000, or $10,000 for a Marginal earned on the large plan
   plan_state: PlanState; // Category-supported, Conditional or Research first — how executable the farm plan is
   gas_total_usd: number; // the backend-computed gas total for the row's farm plan, dollars — the dashboard displays this number, it never recomputes gas
+  breakeven_drop_share: number; // the drop share at which the row's farm plan breaks even — the share where the reward covers the gas plus the 5% annual cost of the capital over the hold; above 1 the plan never breaks even
+  net_plan_gas50_usd: number; // conditional net at the row's plan size, neutral 3% drop, with the gas budget at +50% — sensitivity only, the verdict never changes
+  net_plan_gas100_usd: number; // conditional net at the row's plan size, neutral 3% drop, with the gas budget doubled — sensitivity only
+  verdict_gas50: FarmVerdict; // the farm verdict recomputed with the gas budget at +50% — sensitivity only, the row's verdict never changes
+  verdict_gas100: FarmVerdict; // the farm verdict recomputed with the gas budget doubled — sensitivity only
   flat_rank: number; // the row's rank by flat TVL value alone
   radar_rank: number; // the row's rank by the radar formula alone
   rank_diff: number; // flat_rank minus radar_rank: positive when the radar formula ranks the protocol higher than flat TVL does
@@ -531,7 +541,7 @@ export interface RadarData {
   live_size: number; // live-token row count
   live: LiveRow[]; // live-token protocols, by market cap
   rows: RadarRow[]; // ranked rows, compact form
-  comparison: ModelComparison; // radar-2 versus radar-8, computed by the build
+  comparison: ModelComparison; // radar-2 versus radar-9, computed by the build
   propensity: PropensityModel; // the fitted tokenization-propensity score, so the page recomputes every row's score
   age_ablation: AgeAblation; // the three feature specs side by side and whether log age survived
   holdout: HoldoutSummary; // what the out-of-sample holdout tests say about the value model
@@ -578,7 +588,7 @@ export function ageDays(
   return days < 0 ? 0 : days;
 }
 
-/** The board-wide figures the radar-8 score is anchored on. The TVL anchor is one definition
+/** The board-wide figures the radar-9 score is anchored on. The TVL anchor is one definition
  * everywhere: the traded-token median, shrunk by category toward the global median. */
 export interface ModelContext {
   anchorByCategory: Map<string, number>; // unified TVL anchor per category (traded-token, shrunk)
@@ -626,7 +636,7 @@ export function anchorFor(
   return anchors.byCategory.get(category ?? 'Other') ?? anchors.global;
 }
 
-/** One protocol's factors and launch value under the radar-8 formula: the same sub-linear
+/** One protocol's factors and launch value under the radar-9 formula: the same sub-linear
  * TVL base, now anchored on the unified traded-token anchor, category-relative growth and
  * chain factor, blended in log space with the flat TVL multiple at the rolling-chosen
  * alpha — ln V = alpha x ln V_radar + (1 - alpha) x ln V_flat. Alpha 1 is the radar
@@ -1095,7 +1105,7 @@ function quantile(ordered: number[], q: number): number {
   return ordered[lo]! + (ordered[hi]! - ordered[lo]!) * (pos - lo);
 }
 
-/** One protocol's value under the radar-8 formula, with anchors fitted on the priced set
+/** One protocol's value under the radar-9 formula, with anchors fitted on the priced set
  * given: the traded-token anchor (shrunk by category, the one definition shared with the
  * board) and the category growth medians, so the holdout tests the formula's shape, not
  * the board's numbers. */
@@ -1495,10 +1505,13 @@ export function rollingValidation(
     const end = b === 3 ? dated.length : start + blockSize;
     blocks.push(dated.slice(start, end));
   }
-  // Per block and per alpha: the block priced from prior data only. The training set's
-  // raw log errors under the round base set the block's scale factor, so the scale never
-  // sees the block it prices. Range endpoints come from the training set's nested
-  // leave-one-out log errors under the same alpha — prior data only, never the block.
+  // Per block and per alpha: the block priced from prior data only. The block's scale
+  // factor belongs to the radar component alone — exp(median log error of the training
+  // set's radar values), the same rule nestedLoo uses — so the scale never sees the
+  // block it prices and the flat multiple stays untouched. At alpha 0 the prediction is
+  // the flat multiple exactly; at alpha 1 the calibrated radar alone. Range endpoints
+  // come from the training set's nested leave-one-out log errors under the same alpha —
+  // prior data only, never the block.
   const blockMiss: number[][] = []; // [block][alpha] median miss
   const blockFlatMiss: number[] = [];
   const blockCentral: number[][] = []; // [block][alpha] Historical model error range coverage
@@ -1524,16 +1537,19 @@ export function rollingValidation(
     const centralRow: number[] = [];
     const p1090Row: number[] = [];
     const missesRow: number[][] = [];
+    const trainRadarLog = train.map((entry) => Math.log(entry.mcap_usd! / valueForHoldout(entry, trainSet.anchors, trainSet.catMedians, MODEL)));
+    const kRadar = Math.exp(median(trainRadarLog.sort((x, y) => x - y)) ?? 0);
     for (let a = 0; a < BLEND_ALPHAS.length; a++) {
       const alpha = BLEND_ALPHAS[a]!;
-      const trainLog = train.map((entry) => Math.log(entry.mcap_usd! / blendedValue(entry, trainSet, MODEL, alpha)));
-      const kB = Math.exp(median(trainLog.sort((x, y) => x - y)) ?? 0);
       const ep = endpoints[a]!;
       const misses: number[] = [];
       let inCentral = 0;
       let in1090 = 0;
       for (const entry of test) {
-        const predicted = Math.max(1, Math.round(blendedValue(entry, trainSet, MODEL, alpha) * kB));
+        const radar = valueForHoldout(entry, trainSet.anchors, trainSet.catMedians, MODEL) * kRadar;
+        const flat = trainSet.flatMultiple * entry.tvl_usd;
+        const blended = alpha >= 1 ? radar : alpha <= 0 ? flat : Math.exp(alpha * Math.log(Math.max(1, radar)) + (1 - alpha) * Math.log(Math.max(1, flat)));
+        const predicted = Math.max(1, Math.round(blended));
         const actual = entry.mcap_usd!;
         misses.push(Math.max(predicted / actual, actual / predicted));
         if (predicted * ep.lo <= actual && actual <= predicted * ep.hi) inCentral++;
@@ -1648,6 +1664,13 @@ export function accountingOf(snapshot: Snapshot): AccountingGroup[] {
   return groups.map(([key, label]) => ({ key, label, count: counts.get(key) ?? 0 }));
 }
 
+/** The opportunity cost of the capital over the hold: the plan size at the 5% annual
+ * rate for the hold's days — the model's own cost of capital, stated as an assumption,
+ * not a market rate. */
+export function opportunityCostFor(size: number, holdDays: number): number {
+  return (size * FARM.opportunity_rate * holdDays) / 365;
+}
+
 /** The conditional net of farming one protocol at one plan size under one drop-share
  * scenario: the drop share of the launch value, allocated in proportion to the plan's share
  * of TVL, less the gas and the opportunity cost of the capital over the hold. Conditional
@@ -1665,10 +1688,60 @@ export function farmNet(
   size: number,
   dropShare: number,
 ): number {
+  return farmNetAtGas(entry, valueIfLaunches, age, size, dropShare, 1);
+}
+
+/** The conditional net at one gas scale: gasScale 1 is the budget the verdicts use; 1.5
+ * and 2 are the sensitivity cases the drawer prints — the verdicts never change. The
+ * gas scale multiplies the gas budget only; the reward and the opportunity cost are
+ * untouched. */
+export function farmNetAtGas(
+  entry: SnapshotProtocol,
+  valueIfLaunches: number,
+  age: number | null,
+  size: number,
+  dropShare: number,
+  gasScale: number,
+): number {
   const hold = holdDaysFor(age);
-  const gas = gasForPlan(entry, hold);
+  const gas = gasForPlan(entry, hold) * gasScale;
   const reward = entry.tvl_usd > 0 ? valueIfLaunches * dropShare * (size / entry.tvl_usd) : 0;
-  return Math.round((reward - gas - (size * FARM.opportunity_rate * hold) / 365) * 100) / 100;
+  return Math.round((reward - gas - opportunityCostFor(size, hold)) * 100) / 100;
+}
+
+/** The drop share at which a farm plan breaks even: the share of the launch value where
+ * the reward covers the gas plus the opportunity cost of the capital over the hold.
+ * Reward = launchValue x dropShare x capital / TVL, so the break-even share is
+ * (gas + opportunityCost) x TVL / (launchValue x capital); on a flat board the launch
+ * value is the flat multiple times TVL and this reduces to (gas + opportunityCost) /
+ * (flatMultiple x capital) — the reward itself does not depend on TVL, only the gas,
+ * the hold and the capital do. Above 1 the plan never breaks even, even if the whole
+ * launch value were dropped. */
+export function breakevenDropShare(
+  entry: SnapshotProtocol,
+  valueIfLaunches: number,
+  age: number | null,
+  size: number,
+): number {
+  const hold = holdDaysFor(age);
+  const cost = gasForPlan(entry, hold) + opportunityCostFor(size, hold);
+  if (entry.tvl_usd <= 0 || valueIfLaunches <= 0 || size <= 0) return 0;
+  return Math.round(((cost * entry.tvl_usd) / (valueIfLaunches * size)) * 10000) / 10000;
+}
+
+/** The farm verdict at one gas scale: the same rules as farmVerdictFor, with the gas
+ * budget multiplied — the sensitivity cases the drawer prints, never the verdicts. */
+export function farmVerdictAtGas(
+  entry: SnapshotProtocol,
+  valueIfLaunches: number,
+  age: number | null,
+  gasScale: number,
+): FarmVerdict {
+  return farmVerdictFor(
+    farmNetAtGas(entry, valueIfLaunches, age, FARM.plan_small, FARM.drop_share_conservative, gasScale),
+    farmNetAtGas(entry, valueIfLaunches, age, FARM.plan_small, FARM.drop_share_neutral, gasScale),
+    farmNetAtGas(entry, valueIfLaunches, age, FARM.plan_large, FARM.drop_share_neutral, gasScale),
+  );
 }
 
 /** The farm verdict, judged on each plan size independently: Farm when even the conservative
@@ -1742,9 +1815,9 @@ export function buildBoard(
   }
   const ctx: ModelContext = { anchorByCategory: anchors.byCategory, globalAnchor: anchors.global, categoryMedian, blendAlpha: blend.alpha, flatMultiple: blend.flatMultiple };
 
-  // Radar-8 scores each row as three separate numbers: the launch value is the primary USD
+  // Radar-9 scores each row as three separate numbers: the launch value is the primary USD
   // value and the board's ranking; the tokenization propensity is an auxiliary indicator,
-  // never multiplied into a USD value; the risk-adjusted score is launch value times
+  // never multiplied into a USD value; the propensity-weighted priority is launch value times
   // propensity, a unitless sort aid. The launch value blends the radar formula with the
   // flat TVL multiple at the rolling-chosen alpha — alpha 0 is the flat fallback. The
   // range is the holdout error distribution around the launch value, assuming a launch.
@@ -1779,8 +1852,15 @@ export function buildBoard(
     const flatRank = flatRankBySlug.get(item.entry.slug)!;
     const radarRank = radarRankBySlug.get(item.entry.slug)!;
     // The gas total comes from the backend alone: gasForPlan here is the single source,
-    // the dashboard displays this number and never recomputes it.
+    // the dashboard displays this number and never recomputes it. The break-even share
+    // and the gas sensitivity are computed from the same backend numbers, at the row's
+    // own plan size — the sensitivity never changes the verdict.
     const gasTotal = gasForPlan(item.entry, holdDaysFor(item.age));
+    const breakeven = breakevenDropShare(item.entry, item.valueIfLaunches, item.age, planSize);
+    const netPlanGas50 = farmNetAtGas(item.entry, item.valueIfLaunches, item.age, planSize, FARM.drop_share_neutral, 1.5);
+    const netPlanGas100 = farmNetAtGas(item.entry, item.valueIfLaunches, item.age, planSize, FARM.drop_share_neutral, 2);
+    const verdictGas50 = farmVerdictAtGas(item.entry, item.valueIfLaunches, item.age, 1.5);
+    const verdictGas100 = farmVerdictAtGas(item.entry, item.valueIfLaunches, item.age, 2);
     return {
       rank: i + 1, slug: item.entry.slug, name: item.entry.name,
       category: item.entry.category, chains: item.entry.chains, tvl_usd: item.entry.tvl_usd,
@@ -1798,6 +1878,11 @@ export function buildBoard(
       farm_plan_size: planSize,
       plan_state: state,
       gas_total_usd: gasTotal,
+      breakeven_drop_share: breakeven,
+      net_plan_gas50_usd: netPlanGas50,
+      net_plan_gas100_usd: netPlanGas100,
+      verdict_gas50: verdictGas50,
+      verdict_gas100: verdictGas100,
       flat_rank: flatRank, radar_rank: radarRank, rank_diff: flatRank - radarRank,
       net_1000_usd: netSmall, net_10000_usd: netLarge,
       net_1000_conservative_usd: netSmallConservative, net_1000_optimistic_usd: netSmallOptimistic,
@@ -2090,6 +2175,11 @@ export function radarRow(
     farm_verdict: boardRow.farm_verdict, off_list: boardRow.off_list,
     farm_plan_size: boardRow.farm_plan_size, plan_state: boardRow.plan_state,
     gas_total_usd: boardRow.gas_total_usd,
+    breakeven_drop_share: boardRow.breakeven_drop_share,
+    net_plan_gas50_usd: boardRow.net_plan_gas50_usd,
+    net_plan_gas100_usd: boardRow.net_plan_gas100_usd,
+    verdict_gas50: boardRow.verdict_gas50,
+    verdict_gas100: boardRow.verdict_gas100,
     flat_rank: boardRow.flat_rank, radar_rank: boardRow.radar_rank, rank_diff: boardRow.rank_diff,
     net_1000_usd: boardRow.net_1000_usd, net_10000_usd: boardRow.net_10000_usd,
     net_1000_conservative_usd: boardRow.net_1000_conservative_usd,
@@ -2126,7 +2216,7 @@ function spearman(v2Rank: Map<string, number>, currentRank: Map<string, number>)
  * own unified anchor; age is the old maturity factor dropped; chain is the 3% step over
  * the old 4%. The board value blends that radar component toward the flat TVL multiple at
  * the rolling-chosen alpha, so the product is the radar component's ratio, not the board
- * value's. The tokenization propensity is not a ratio here: radar-8 does not multiply it
+ * value's. The tokenization propensity is not a ratio here: radar-9 does not multiply it
  * into the value, so it cannot move a row against radar-2.
  */
 function changeRatios(
@@ -2175,7 +2265,7 @@ function moveReason(
     const clamped = Math.max(MODEL_V2.growth_floor, Math.min(MODEL_V2.growth_cap, change));
     const growthV2 = 1 + (clamped / 100) * MODEL_V2.growth_weight;
     if (movedUp) return 'Outgrew its category: seven-day change ' + fmtPct(change) + ' against a ' + (row.category ?? 'Other') + ' median of ' + fmtPct(catMedian) + ' (growth ' + row.model.growth_factor.toFixed(2) + 'x, where radar-2 paid ' + growthV2.toFixed(2) + 'x).';
-    if (growthV2 >= 1.5) return 'The seven-day spike radar-2 rewarded at ' + growthV2.toFixed(2) + 'x is capped at ' + row.model.growth_factor.toFixed(2) + 'x under radar-8: seven-day change ' + fmtPct(change) + ' against a ' + (row.category ?? 'Other') + ' median of ' + fmtPct(catMedian) + '.';
+    if (growthV2 >= 1.5) return 'The seven-day spike radar-2 rewarded at ' + growthV2.toFixed(2) + 'x is capped at ' + row.model.growth_factor.toFixed(2) + 'x under radar-9: seven-day change ' + fmtPct(change) + ' against a ' + (row.category ?? 'Other') + ' median of ' + fmtPct(catMedian) + '.';
     return 'Lagged its category: seven-day change ' + fmtPct(change) + ' against a ' + (row.category ?? 'Other') + ' median of ' + fmtPct(catMedian) + ' (growth ' + row.model.growth_factor.toFixed(2) + 'x, where radar-2 paid ' + growthV2.toFixed(2) + 'x).';
   }
   if (kind === 'compression') {
@@ -2189,7 +2279,7 @@ function moveReason(
   return 'Chain breadth: the chain step fell from 4% to 3%, so extra chains count for less than they did.';
 }
 
-/** The radar-2 versus radar-8 comparison: Spearman correlation and the biggest movers. */
+/** The radar-2 versus radar-9 comparison: Spearman correlation and the biggest movers. */
 function buildComparison(
   ranked: BoardRow[],
   v2RankBySlug: Map<string, number>,
@@ -2380,6 +2470,12 @@ export function boardIssue(
     if (row.farm_plan_size !== 1000 && row.farm_plan_size !== 10000) return row.slug + ' has farm plan size ' + row.farm_plan_size;
     if (row.plan_state !== 'Category-supported' && row.plan_state !== 'Conditional' && row.plan_state !== 'Research first') return row.slug + ' has plan state ' + row.plan_state;
     if (Number.isFinite(row.gas_total_usd) === false || row.gas_total_usd < 0) return row.slug + ' has gas total ' + row.gas_total_usd;
+    if (Number.isFinite(row.breakeven_drop_share) === false || row.breakeven_drop_share < 0) return row.slug + ' has break-even drop share ' + row.breakeven_drop_share;
+    if (row.verdict_gas50 !== 'Farm' && row.verdict_gas50 !== 'Marginal' && row.verdict_gas50 !== 'Skip') return row.slug + ' has gas+50% verdict ' + row.verdict_gas50;
+    if (row.verdict_gas100 !== 'Farm' && row.verdict_gas100 !== 'Marginal' && row.verdict_gas100 !== 'Skip') return row.slug + ' has gas+100% verdict ' + row.verdict_gas100;
+    const planNet = row.farm_plan_size === 10000 ? row.net_10000_usd : row.net_1000_usd;
+    if (Math.abs(row.net_plan_gas50_usd - Math.round((planNet - 0.5 * row.gas_total_usd) * 100) / 100) > 0.02) return row.slug + ' has gas+50% net ' + row.net_plan_gas50_usd + ' but the plan net less half the gas is ' + Math.round((planNet - 0.5 * row.gas_total_usd) * 100) / 100;
+    if (Math.abs(row.net_plan_gas100_usd - Math.round((planNet - row.gas_total_usd) * 100) / 100) > 0.02) return row.slug + ' has gas+100% net ' + row.net_plan_gas100_usd + ' but the plan net less the gas is ' + Math.round((planNet - row.gas_total_usd) * 100) / 100;
     if (row.flat_rank < 1 || row.flat_rank > board.length || row.radar_rank < 1 || row.radar_rank > board.length) return row.slug + ' has a rank outside 1..' + board.length;
     if (row.rank_diff !== row.flat_rank - row.radar_rank) return row.slug + ' has rank diff ' + row.rank_diff + ' but flat ' + row.flat_rank + ' minus radar ' + row.radar_rank + ' is ' + (row.flat_rank - row.radar_rank);
     if (row.propensity <= 0 || row.propensity > 1) return row.slug + ' has propensity ' + row.propensity;
